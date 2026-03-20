@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  kubric-generator:
+    build: .
+    container_name: kubric-generator
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
