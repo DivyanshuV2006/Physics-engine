@@ -1,0 +1,13 @@
+# Core Machine Learning Framework
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Data Generation & Processing
+numpy>=1.24.0
+imageio>=2.31.0
+
+# Training Utilities
+tqdm>=4.65.0
+
+# Synthetic Data Engine
+kubric
