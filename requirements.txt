@@ -1,13 +1,15 @@
 # Core Machine Learning Framework
+# Why: Provides tensor ops, autograd, and training/runtime primitives.
 torch>=2.0.0
+# Why: Common vision transforms/utilities that pair with PyTorch workflows.
 torchvision>=0.15.0
 
 # Data Generation & Processing
+# Why: Numerical array backbone for depth and segmentation map handling.
 numpy>=1.24.0
+# Why: Lightweight image I/O used for PNG frame export.
 imageio>=2.31.0
 
 # Training Utilities
+# Why: Progress bars for long-running generation/training loops.
 tqdm>=4.65.0
-
-# Synthetic Data Engine
-kubric

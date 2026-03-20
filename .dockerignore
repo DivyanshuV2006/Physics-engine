@@ -1,11 +1,14 @@
+# Ignore Python cache artifacts that bloat build context and are reproducible.
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
+# Ignore local virtual env and secrets/environment files from host machine.
 .venv/
 .env
 
+# Ignore generated data and model artifacts to keep Docker builds fast/stable.
 dataset/
 *.npy
 *.pt

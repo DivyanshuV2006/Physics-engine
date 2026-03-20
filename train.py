@@ -11,8 +11,25 @@ from tqdm import tqdm
 from dataset import KubricOcclusionDataset
 from model import DepthRoutedLatentWorldModel
 
+"""Training entrypoint for the depth-routed latent world model.
+
+This script assembles data, model, optimizer, and losses into a standard
+PyTorch loop so experiments are reproducible and easy to run from CLI.
+"""
+
 
 def train(args: argparse.Namespace) -> None:
+    """Runs supervised training on latent and occlusion-mask targets.
+
+    What:
+        Optimizes the model to predict future latent frames (`target_z`) and
+        visibility masks (`target_mask`) simultaneously.
+    How:
+        Forward pass -> MSE(latents) + BCE(masks) -> backward -> AdamW step.
+    Why:
+        Joint optimization encourages both appearance consistency and explicit
+        occlusion reasoning, which is central to object permanence.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset = KubricOcclusionDataset(
@@ -37,7 +54,9 @@ def train(args: argparse.Namespace) -> None:
     ).to(device)
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # MSE supervises continuous latent reconstruction quality.
     latent_loss_fn = nn.MSELoss()
+    # BCE supervises binary visibility probabilities for occlusion masks.
     mask_loss_fn = nn.BCELoss()
 
     model.train()
@@ -58,6 +77,7 @@ def train(args: argparse.Namespace) -> None:
             z_hat, mask_hat = model(z_0=z_0, depth_map=depth_map, trajectory=trajectory)
 
             latent_loss = latent_loss_fn(z_hat, target_z)
+            # Clamp avoids numerical issues in BCE with exact 0/1 probabilities.
             mask_hat_clamped = mask_hat.clamp(min=1e-4, max=1.0 - 1e-4)
             mask_loss = mask_loss_fn(mask_hat_clamped, target_mask)
             total_loss = latent_loss + mask_loss
@@ -85,6 +105,7 @@ def train(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """Defines CLI arguments for reproducible experiment configuration."""
     parser = argparse.ArgumentParser(description="Train Depth-Routed Latent World Model")
     parser.add_argument("--data-root", type=str, required=True, help="Root directory of Kubric-style scenes")
     parser.add_argument("--epochs", type=int, default=20)

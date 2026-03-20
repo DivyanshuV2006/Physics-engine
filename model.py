@@ -7,9 +7,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+"""Core model components for depth-routed latent prediction.
+
+This file defines the full architecture that:
+1) extracts an initial object-centric slot from the first latent frame,
+2) evolves that slot through a trajectory-driven recurrent dynamics module,
+3) gates visibility using depth comparison against the scene depth map, and
+4) renders per-step latent predictions and masks.
+"""
+
 
 class SlotExtractor(nn.Module):
-    """Lightweight CNN + MLP that extracts a slot vector and scalar depth."""
+    """Extracts a compact slot state and an object depth estimate.
+
+    What:
+        Encodes `z_0` into a latent slot vector (`initial_slot`) and a scalar
+        depth (`slot_depth`) that represents the object's relative depth.
+    How:
+        A lightweight CNN compresses spatial information, then an MLP maps the
+        pooled features to `slot_dim + 1` outputs.
+    Why:
+        The slot is the persistent state used by the dynamics model, while the
+        depth scalar is required by depth routing to infer visibility/occlusion.
+    """
 
     def __init__(self, in_channels: int, slot_dim: int) -> None:
         super().__init__()
@@ -27,6 +47,7 @@ class SlotExtractor(nn.Module):
         )
 
     def forward(self, z_0: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Runs slot extraction from the first latent observation."""
         x = self.encoder(z_0).flatten(1)  # [B, 128]
         out = self.mlp(x)  # [B, slot_dim + 1]
         initial_slot = out[:, :-1]  # [B, slot_dim]
@@ -35,7 +56,17 @@ class SlotExtractor(nn.Module):
 
 
 class SpatialBroadcastDecoder(nn.Module):
-    """Decodes a slot state into a spatial latent map."""
+    """Decodes a slot vector into a full latent feature map.
+
+    What:
+        Produces a spatial latent tensor `[B, C, H, W]` from slot states.
+    How:
+        Broadcasts the slot over the image plane, concatenates XY coordinates,
+        and applies convolutional decoding.
+    Why:
+        Spatial broadcasting injects explicit positional context, which makes it
+        easier for the decoder to reconstruct structured scene latents.
+    """
 
     def __init__(self, slot_dim: int, out_channels: int) -> None:
         super().__init__()
@@ -48,9 +79,12 @@ class SpatialBroadcastDecoder(nn.Module):
         )
 
     def forward(self, slot: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        """Renders one latent frame from a slot state."""
         batch_size, slot_dim = slot.shape
         slot_map = slot.view(batch_size, slot_dim, 1, 1).expand(-1, -1, height, width)
 
+        # Coordinate channels encode absolute pixel locations so the decoder can
+        # learn spatially-aware structure from a globally broadcast slot.
         y_coords = torch.linspace(-1.0, 1.0, steps=height, device=slot.device, dtype=slot.dtype)
         x_coords = torch.linspace(-1.0, 1.0, steps=width, device=slot.device, dtype=slot.dtype)
         yy, xx = torch.meshgrid(y_coords, x_coords, indexing="ij")
@@ -62,6 +96,15 @@ class SpatialBroadcastDecoder(nn.Module):
 
 class DepthRoutedLatentWorldModel(nn.Module):
     """
+    What:
+      End-to-end latent world model with depth-aware visibility routing.
+    How:
+      SlotExtractor -> PhysicsRNN (trajectory-conditioned rollout) ->
+      DepthRouter (grid-sampled depth comparison) -> Spatial decoder.
+    Why:
+      Forces temporal predictions to respect occlusion constraints so objects
+      remain persistent in latent dynamics even when hidden.
+
     Inputs:
       - z_0: [B, C, H, W]
       - depth_map: [B, 1, H, W]
@@ -89,6 +132,15 @@ class DepthRoutedLatentWorldModel(nn.Module):
         depth_map: torch.Tensor, trajectory_t: torch.Tensor, slot_depth: torch.Tensor
     ) -> torch.Tensor:
         """
+        What:
+            Computes per-sample visibility based on depth ordering.
+        How:
+            Uses `grid_sample` to read background depth at trajectory coordinates,
+            then compares the sampled depth against predicted object depth.
+        Why:
+            A physically motivated visibility gate reduces impossible renderings
+            where occluded objects leak through foreground geometry.
+
         depth_map: [B, 1, H, W]
         trajectory_t: [B, 2]
         slot_depth: [B, 1]
@@ -104,12 +156,21 @@ class DepthRoutedLatentWorldModel(nn.Module):
         ).view(trajectory_t.shape[0], 1)  # [B, 1]
 
         # Visible if object depth is in front of (or equal to) sampled background depth.
-        visible = (slot_depth <= bg_depth).float()  # [B, 1]
+        # Differentiable soft-routing using a steep sigmoid
+        # bg_depth > slot_depth -> positive -> sigmoid approaches 1.0 (visible)
+        # bg_depth < slot_depth -> negative -> sigmoid approaches 0.0 (occluded)
+        temperature = 20.0 
+        visible = torch.sigmoid((bg_depth - slot_depth) * temperature) # [B, 1]
         return visible
 
     def forward(
         self, z_0: torch.Tensor, depth_map: torch.Tensor, trajectory: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Rolls out depth-routed latent predictions across time.
+
+        The recurrent state models object dynamics, while depth routing applies
+        a visibility mask at each step before outputs are stacked as sequences.
+        """
         if z_0.ndim != 4:
             raise ValueError(f"z_0 must be [B, C, H, W], got shape {tuple(z_0.shape)}")
         if depth_map.ndim != 4:
@@ -128,6 +189,7 @@ class DepthRoutedLatentWorldModel(nn.Module):
 
         time_iterator = range(time_steps)
         if self.use_tqdm:
+            # Optional fine-grained progress when debugging long rollouts.
             time_iterator = tqdm(time_iterator, desc="Model rollout", leave=False)
 
         for t in time_iterator:

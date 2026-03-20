@@ -1,16 +1,19 @@
-version: "3.9"
-
 services:
   kubric-generator:
+    # Build image from local Dockerfile so code/deps stay versioned with repo.
     build: .
+    # Stable container name simplifies logs, exec, and debugging commands.
     container_name: kubric-generator
+    # Match Dockerfile workspace so relative paths behave consistently.
     working_dir: /workspace
     volumes:
+      # Bind mount keeps generated dataset files on host Windows disk instantly.
       - .:/workspace
     deploy:
       resources:
         reservations:
           devices:
+            # Request NVIDIA GPU for Kubric/Blender accelerated rendering.
             - driver: nvidia
               count: all
               capabilities:

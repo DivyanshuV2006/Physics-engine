@@ -8,6 +8,12 @@ import imageio.v3 as iio
 import numpy as np
 from tqdm import tqdm
 
+"""Kubric synthetic data generator for occlusion-centric video sequences.
+
+The generator creates deterministic scene layouts with semantic IDs so downstream
+training can consume RGB, depth, and target-object visibility masks per frame.
+"""
+
 try:
     import kubric as kb
     from kubric.renderer import Blender
@@ -28,6 +34,17 @@ SEMANTIC_ID_TARGET = 3
 
 
 def _build_scene(sequence_seed: int = 0) -> kb.Scene:
+    """Creates one Kubric scene with floor, wall occluder, and moving sphere.
+
+    What:
+        Builds the exact scene graph required for object-permanence tests.
+    How:
+        Configures camera/light, adds semantic-labeled assets, and keyframes
+        the target sphere from left to right behind the foreground wall.
+    Why:
+        Controlled geometry + semantics make occlusion behavior predictable and
+        easy to supervise in the generated dataset.
+    """
     rng = np.random.default_rng(sequence_seed)
     scene = kb.Scene(
         resolution=RESOLUTION,
@@ -99,6 +116,12 @@ def _build_scene(sequence_seed: int = 0) -> kb.Scene:
 
 
 def _select_segmentation_map(render_data: Dict[str, np.ndarray]) -> np.ndarray:
+    """Retrieves segmentation output from renderer results across API variants.
+
+    Why:
+        Different Kubric versions may expose either `semantic_segmentation` or
+        `segmentation`; this compatibility layer keeps export logic stable.
+    """
     # Kubric naming can vary with renderer/version. Prefer semantic if available.
     if "semantic_segmentation" in render_data:
         return render_data["semantic_segmentation"]
@@ -116,6 +139,16 @@ def _save_sequence_frames(
     depth_stack: np.ndarray,
     segmentation_stack: np.ndarray,
 ) -> None:
+    """Writes per-frame RGB, depth, and binary target masks to disk.
+
+    How:
+        - RGBA -> RGB PNG (`rgba_XXX.png`)
+        - Depth -> float32 NPY (`depth_XXX.npy`) to preserve metric precision
+        - Segmentation -> strict binary mask for semantic ID 3 (`mask_XXX.png`)
+    Why:
+        These exact modalities map directly to the training pipeline inputs and
+        supervision targets.
+    """
     sequence_dir.mkdir(parents=True, exist_ok=True)
 
     num_frames = rgba_stack.shape[0]
@@ -144,6 +177,12 @@ def generate_sequence(
     output_root: Path,
     scratch_root: Path | None = None,
 ) -> None:
+    """Renders one full sequence and exports all required frame artifacts.
+
+    Why validation checks exist:
+        They fail fast when render outputs are incomplete or frame counts drift,
+        preventing silent dataset corruption.
+    """
     scene = _build_scene(sequence_seed=sequence_id)
     scratch_dir = scratch_root if scratch_root is not None else output_root / "_scratch"
     scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -175,6 +214,7 @@ def generate_sequence(
 
 
 def parse_args() -> argparse.Namespace:
+    """Parses CLI options for dataset destination and sequence count."""
     parser = argparse.ArgumentParser(
         description="Generate Kubric synthetic sequences for 3D object permanence tests."
     )
@@ -200,6 +240,8 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    # Main loop intentionally keeps sequence generation explicit and serial so
+    # failures can be traced to specific `sequence_id` values.
     args = parse_args()
     args.output_root.mkdir(parents=True, exist_ok=True)
 
