@@ -17,6 +17,20 @@ This file defines the full architecture that:
 """
 
 
+def resolve_device(verbose: bool = True) -> torch.device:
+    """Selects CUDA by default and falls back to CPU when unavailable."""
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        if verbose:
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"[Device] Using CUDA: {gpu_name}")
+        return device
+    device = torch.device("cpu")
+    if verbose:
+        print("[Device] CUDA not found. Using CPU.")
+    return device
+
+
 class SlotExtractor(nn.Module):
     """Extracts a compact slot state and an object depth estimate.
 
@@ -120,12 +134,16 @@ class DepthRoutedLatentWorldModel(nn.Module):
         latent_channels: int,
         slot_dim: int = 128,
         use_tqdm: bool = False,
+        device: torch.device | str | None = None,
+        verbose_device: bool = False,
     ) -> None:
         super().__init__()
         self.slot_extractor = SlotExtractor(in_channels=latent_channels, slot_dim=slot_dim)
         self.physics_rnn = nn.GRUCell(input_size=2, hidden_size=slot_dim)
         self.renderer = SpatialBroadcastDecoder(slot_dim=slot_dim, out_channels=latent_channels)
         self.use_tqdm = use_tqdm
+        self.device = torch.device(device) if device is not None else resolve_device(verbose=verbose_device)
+        self.to(self.device)
 
     @staticmethod
     def _route_depth(

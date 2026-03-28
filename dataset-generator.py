@@ -6,12 +6,14 @@ from typing import Dict
 
 import imageio.v3 as iio
 import numpy as np
+import torch
 from tqdm import tqdm
 
 """Kubric synthetic data generator for occlusion-centric video sequences.
 
-The generator creates deterministic scene layouts with semantic IDs so downstream
-training can consume RGB, depth, and target-object visibility masks per frame.
+Primary goal:
+    Generate temporally correct RGB, depth, and target masks where a blue sphere
+    moves from x=-4 to x=4 behind a red foreground occluder.
 """
 
 try:
@@ -27,24 +29,62 @@ RESOLUTION = (256, 256)
 FRAME_START = 1
 FRAME_END = 24
 FPS = 12
+NUM_FRAMES = FRAME_END - FRAME_START + 1
+RENDER_LAYERS = ("rgba", "depth", "segmentation")
 
 SEMANTIC_ID_FLOOR = 1
 SEMANTIC_ID_WALL = 2
 SEMANTIC_ID_TARGET = 3
 
+TARGET_X_START = -4.0
+TARGET_X_END = 4.0
+TARGET_Z = 0.45
 
-def _build_scene(sequence_seed: int = 0) -> kb.Scene:
-    """Creates one Kubric scene with floor, wall occluder, and moving sphere.
 
-    What:
-        Builds the exact scene graph required for object-permanence tests.
-    How:
-        Configures camera/light, adds semantic-labeled assets, and keyframes
-        the target sphere from left to right behind the foreground wall.
-    Why:
-        Controlled geometry + semantics make occlusion behavior predictable and
-        easy to supervise in the generated dataset.
+def resolve_device(verbose: bool = True) -> torch.device:
+    """Selects CUDA by default and falls back to CPU when unavailable."""
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        if verbose:
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"[Device] Using CUDA: {gpu_name}")
+        return device
+    device = torch.device("cpu")
+    if verbose:
+        print("[Device] CUDA not found. Using CPU.")
+    return device
+
+
+def _target_x_for_frame(frame: int) -> float:
+    """Returns the expected target x-position for a given frame index."""
+    alpha = (frame - FRAME_START) / max(1, (FRAME_END - FRAME_START))
+    return float(TARGET_X_START + alpha * (TARGET_X_END - TARGET_X_START))
+
+
+def _set_manual_target_animation(target: kb.Object3D, target_y: float) -> None:
+    """Animates the target sphere deterministically across all frames.
+
+    Why this function exists:
+        Some scene configurations only keyframe the endpoints. Depending on
+        renderer/asset state, this can appear frozen. Explicitly writing a
+        keyframe for every frame guarantees movement without physics simulation.
+
+    Implementation detail:
+        The target is treated as a kinematic/static object (`static=True`) and
+        follows manually authored position keyframes only.
     """
+    x_positions = np.linspace(TARGET_X_START, TARGET_X_END, num=NUM_FRAMES, dtype=np.float32)
+    for idx, frame in enumerate(range(FRAME_START, FRAME_END + 1)):
+        target.position = (float(x_positions[idx]), target_y, TARGET_Z)
+        target.keyframe_insert("position", frame=frame)
+
+
+def _build_scene(
+    sequence_seed: int = 0,
+    target_x: float | None = None,
+    use_keyframes: bool = True,
+) -> kb.Scene:
+    """Creates one scene with floor, wall occluder, and manually animated target."""
     rng = np.random.default_rng(sequence_seed)
     scene = kb.Scene(
         resolution=RESOLUTION,
@@ -53,15 +93,15 @@ def _build_scene(sequence_seed: int = 0) -> kb.Scene:
         frame_rate=FPS,
     )
 
-    # Perspective camera looking toward the object motion corridor.
+    # Camera sees the motion corridor and occluder clearly.
     scene.camera = kb.PerspectiveCamera(
         name="camera",
         position=(0.0, -10.0, 4.0),
-        look_at=(0.0, 0.0, 0.75),
+        look_at=(0.0, 0.0, 0.9),
     )
     scene += scene.camera
 
-    # Directional key light for stable shading and silhouettes.
+    # Directional key light plus a soft fill keeps object silhouettes stable.
     sun = kb.DirectionalLight(
         name="sun",
         color=(1.0, 1.0, 1.0),
@@ -69,7 +109,15 @@ def _build_scene(sequence_seed: int = 0) -> kb.Scene:
         position=(6.0, -8.0, 10.0),
         look_at=(0.0, 0.0, 0.0),
     )
+    fill = kb.DirectionalLight(
+        name="fill",
+        color=(1.0, 1.0, 1.0),
+        intensity=1.0,
+        position=(-6.0, -6.0, 6.0),
+        look_at=(0.0, 0.0, 0.0),
+    )
     scene += sun
+    scene += fill
 
     floor = kb.Cube(
         name="floor",
@@ -84,8 +132,8 @@ def _build_scene(sequence_seed: int = 0) -> kb.Scene:
 
     wall = kb.Cube(
         name="wall_occluder",
-        scale=(0.65, 1.8, 1.8),
-        position=(0.0, -1.2, 1.0),
+        scale=(0.7, 1.7, 1.8),
+        position=(0.0, -0.9, 1.0),
         static=True,
         material=kb.PrincipledBSDFMaterial(color=(0.90, 0.05, 0.05)),
     )
@@ -93,12 +141,14 @@ def _build_scene(sequence_seed: int = 0) -> kb.Scene:
     wall.segmentation_id = SEMANTIC_ID_WALL
     scene += wall
 
-    # Slight per-sequence depth jitter keeps test sequences distinct.
-    target_y = float(rng.uniform(0.6, 1.2))
+    # Keep y near center so the trajectory always passes behind the wall.
+    target_y = float(rng.uniform(0.95, 1.25))
     target = kb.Sphere(
         name="target",
         scale=0.45,
-        position=(-4.0, target_y, 0.45),
+        position=(TARGET_X_START if target_x is None else target_x, target_y, TARGET_Z),
+        # Keep non-static so Blender evaluates transform keyframes correctly.
+        # We still bypass physics simulation entirely; motion is keyframe-driven.
         static=False,
         material=kb.PrincipledBSDFMaterial(color=(0.05, 0.25, 0.95)),
     )
@@ -106,23 +156,13 @@ def _build_scene(sequence_seed: int = 0) -> kb.Scene:
     target.segmentation_id = SEMANTIC_ID_TARGET
     scene += target
 
-    # Animate target to pass behind the red wall from camera viewpoint.
-    target.position = (-4.0, target_y, 0.45)
-    target.keyframe_insert("position", FRAME_START)
-    target.position = (4.0, target_y, 0.45)
-    target.keyframe_insert("position", FRAME_END)
-
+    if use_keyframes:
+        _set_manual_target_animation(target, target_y)
     return scene
 
 
 def _select_segmentation_map(render_data: Dict[str, np.ndarray]) -> np.ndarray:
-    """Retrieves segmentation output from renderer results across API variants.
-
-    Why:
-        Different Kubric versions may expose either `semantic_segmentation` or
-        `segmentation`; this compatibility layer keeps export logic stable.
-    """
-    # Kubric naming can vary with renderer/version. Prefer semantic if available.
+    """Retrieves segmentation map from renderer output across Kubric versions."""
     if "semantic_segmentation" in render_data:
         return render_data["semantic_segmentation"]
     if "segmentation" in render_data:
@@ -137,59 +177,57 @@ def _save_sequence_frames(
     sequence_dir: Path,
     rgba_stack: np.ndarray,
     depth_stack: np.ndarray,
-    segmentation_stack: np.ndarray,
+    mask_stack: np.ndarray,
 ) -> None:
-    """Writes per-frame RGB, depth, and binary target masks to disk.
+    """Writes final deliverables only (png/npy/png) into sequence directory.
 
-    How:
-        - RGBA -> RGB PNG (`rgba_XXX.png`)
-        - Depth -> float32 NPY (`depth_XXX.npy`) to preserve metric precision
-        - Segmentation -> strict binary mask for semantic ID 3 (`mask_XXX.png`)
-    Why:
-        These exact modalities map directly to the training pipeline inputs and
-        supervision targets.
+    Important:
+        This function does not write EXR files. Any renderer scratch EXR output
+        stays in a separate scratch directory and never enters `sequence_XXXX`.
     """
     sequence_dir.mkdir(parents=True, exist_ok=True)
 
-    num_frames = rgba_stack.shape[0]
-    for f in range(num_frames):
-        rgba = rgba_stack[f]
-        if rgba.shape[-1] == 4:
-            rgb = rgba[..., :3]
-        else:
-            rgb = rgba
+    for frame_idx in range(rgba_stack.shape[0]):
+        rgba = np.asarray(rgba_stack[frame_idx])
+        rgb = rgba[..., :3] if rgba.shape[-1] == 4 else rgba
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
 
-        depth = np.asarray(depth_stack[f], dtype=np.float32)
+        depth = np.asarray(depth_stack[frame_idx], dtype=np.float32)
         depth = np.squeeze(depth).astype(np.float32)
 
-        seg = np.asarray(segmentation_stack[f])
-        seg = np.squeeze(seg).astype(np.int32)
-        mask = (seg == SEMANTIC_ID_TARGET).astype(np.uint8) * 255
+        mask = np.asarray(mask_stack[frame_idx], dtype=np.uint8)
+        mask = np.squeeze(mask)
 
-        iio.imwrite(sequence_dir / f"rgba_{f:03d}.png", rgb)
-        np.save(sequence_dir / f"depth_{f:03d}.npy", depth)
-        iio.imwrite(sequence_dir / f"mask_{f:03d}.png", mask)
+        iio.imwrite(sequence_dir / f"rgba_{frame_idx:03d}.png", rgb)
+        np.save(sequence_dir / f"depth_{frame_idx:03d}.npy", depth)
+        iio.imwrite(sequence_dir / f"mask_{frame_idx:03d}.png", mask)
 
 
-def generate_sequence(
-    sequence_id: int,
-    output_root: Path,
-    scratch_root: Path | None = None,
-) -> None:
-    """Renders one full sequence and exports all required frame artifacts.
+def _infer_target_instance_id(segmentation_stack: np.ndarray) -> int:
+    """Infers the target instance ID from instance segmentation.
 
-    Why validation checks exist:
-        They fail fast when render outputs are incomplete or frame counts drift,
-        preventing silent dataset corruption.
+    Blender renderer output is instance-indexed rather than semantic-indexed in
+    this environment. The target sphere is the smallest persistent foreground
+    object, so we pick the non-zero ID with the smallest max pixel footprint.
     """
-    scene = _build_scene(sequence_seed=sequence_id)
-    scratch_dir = scratch_root if scratch_root is not None else output_root / "_scratch"
-    scratch_dir.mkdir(parents=True, exist_ok=True)
+    seg = np.asarray(segmentation_stack).squeeze(-1).astype(np.int32)  # [T,H,W]
+    unique_ids = [int(i) for i in np.unique(seg) if int(i) != 0]
+    if not unique_ids:
+        raise ValueError("No non-background instance IDs found in segmentation.")
 
-    renderer = Blender(scene, scratch_dir=scratch_dir)
-    render_data = renderer.render()
+    best_id = unique_ids[0]
+    best_max_area = None
+    for instance_id in unique_ids:
+        per_frame_areas = np.sum(seg == instance_id, axis=(1, 2))
+        max_area = int(np.max(per_frame_areas))
+        if best_max_area is None or max_area < best_max_area:
+            best_max_area = max_area
+            best_id = instance_id
+    return best_id
 
+
+def _extract_stacks(render_data: Dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extracts RGBA/depth and derives a binary target mask from segmentation."""
     if "rgba" not in render_data or "depth" not in render_data:
         missing = [k for k in ("rgba", "depth") if k not in render_data]
         raise KeyError(f"Missing renderer outputs: {missing}")
@@ -198,23 +236,91 @@ def generate_sequence(
     depth_stack = np.asarray(render_data["depth"])
     segmentation_stack = np.asarray(_select_segmentation_map(render_data))
 
-    expected_frames = FRAME_END - FRAME_START + 1
-    for name, stack in (
-        ("rgba", rgba_stack),
-        ("depth", depth_stack),
-        ("segmentation", segmentation_stack),
-    ):
-        if stack.shape[0] != expected_frames:
-            raise ValueError(
-                f"{name} has {stack.shape[0]} frames, expected {expected_frames}."
-            )
+    target_instance_id = _infer_target_instance_id(segmentation_stack)
+    seg = np.asarray(segmentation_stack).squeeze(-1).astype(np.int32)
+    mask_stack = (seg == target_instance_id).astype(np.uint8) * 255  # [T,H,W]
+    return rgba_stack, depth_stack, mask_stack
+
+
+def _render_full_sequence(scene: kb.Scene, scratch_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Renders a keyframed sequence in one pass using only required layers."""
+    renderer = Blender(scene, scratch_dir=scratch_dir)
+    render_data = renderer.render(
+        frames=list(range(FRAME_START, FRAME_END + 1)),
+        return_layers=RENDER_LAYERS,
+    )
+    return _extract_stacks(render_data)
+
+
+def _has_temporal_motion(rgba_stack: np.ndarray, eps: float = 1e-3) -> bool:
+    """Returns True when first and last rendered frames differ."""
+    if rgba_stack.shape[0] < 2:
+        return False
+    a = rgba_stack[0].astype(np.float32)
+    b = rgba_stack[-1].astype(np.float32)
+    mean_abs_diff = float(np.mean(np.abs(a - b)))
+    return mean_abs_diff > eps
+
+
+def _render_fallback_framewise(sequence_seed: int, scratch_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fallback renderer that guarantees motion by rendering frame-by-frame.
+
+    Used only when keyframed full-sequence rendering appears frozen.
+    """
+    rgba_frames = []
+    depth_frames = []
+    mask_frames = []
+
+    for frame in range(FRAME_START, FRAME_END + 1):
+        x = _target_x_for_frame(frame)
+        scene = _build_scene(sequence_seed=sequence_seed, target_x=x, use_keyframes=False)
+        scene.frame_start = FRAME_START
+        scene.frame_end = FRAME_START
+        scene.frame_rate = FPS
+        frame_scratch = scratch_dir / f"fallback_{frame:03d}"
+        frame_scratch.mkdir(parents=True, exist_ok=True)
+
+        renderer = Blender(scene, scratch_dir=frame_scratch)
+        render_data = renderer.render(frames=[FRAME_START], return_layers=RENDER_LAYERS)
+        rgba_stack, depth_stack, mask_stack = _extract_stacks(render_data)
+
+        rgba_frames.append(rgba_stack[0])
+        depth_frames.append(depth_stack[0])
+        mask_frames.append(mask_stack[0])
+
+    return np.stack(rgba_frames, axis=0), np.stack(depth_frames, axis=0), np.stack(mask_frames, axis=0)
+
+
+def generate_sequence(
+    sequence_id: int,
+    output_root: Path,
+    scratch_root: Path | None = None,
+    render_mode: str = "fallback",
+) -> None:
+    """Renders one sequence and exports RGB/depth/binary-mask frame triplets."""
+    scene = _build_scene(sequence_seed=sequence_id, use_keyframes=True)
+    scratch_dir = scratch_root if scratch_root is not None else output_root / "_scratch"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+
+    if render_mode == "full":
+        rgba_stack, depth_stack, mask_stack = _render_full_sequence(scene, scratch_dir=scratch_dir)
+    elif render_mode == "fallback":
+        rgba_stack, depth_stack, mask_stack = _render_fallback_framewise(
+            sequence_seed=sequence_id, scratch_dir=scratch_dir
+        )
+    else:
+        raise ValueError(f"Unknown render_mode '{render_mode}'. Use 'full' or 'fallback'.")
+
+    for name, stack in (("rgba", rgba_stack), ("depth", depth_stack), ("mask", mask_stack)):
+        if stack.shape[0] != NUM_FRAMES:
+            raise ValueError(f"{name} has {stack.shape[0]} frames, expected {NUM_FRAMES}.")
 
     seq_dir = output_root / f"sequence_{sequence_id:04d}"
-    _save_sequence_frames(seq_dir, rgba_stack, depth_stack, segmentation_stack)
+    _save_sequence_frames(seq_dir, rgba_stack, depth_stack, mask_stack)
 
 
 def parse_args() -> argparse.Namespace:
-    """Parses CLI options for dataset destination and sequence count."""
+    """Parses CLI options for output destination and sequence count."""
     parser = argparse.ArgumentParser(
         description="Generate Kubric synthetic sequences for 3D object permanence tests."
     )
@@ -236,20 +342,52 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional scratch directory for Kubric/Blender temp files.",
     )
+    parser.add_argument(
+        "--render-mode",
+        type=str,
+        choices=("auto", "full", "fallback"),
+        default="fallback",
+        help="Rendering strategy: auto-detect, force keyframed full render, or force framewise fallback.",
+    )
     return parser.parse_args()
 
 
+def _choose_render_mode(output_root: Path, scratch_root: Path | None, requested_mode: str) -> str:
+    """Chooses fastest safe render path.
+
+    - `full`: force keyframed full-sequence rendering.
+    - `fallback`: force robust framewise rendering.
+    - `auto`: probe one quick keyframed render once; if no motion is detected,
+      switch all subsequent sequences to fallback mode.
+    """
+    if requested_mode in ("full", "fallback"):
+        return requested_mode
+
+    probe_scene = _build_scene(sequence_seed=999, use_keyframes=True)
+    probe_scratch = (scratch_root if scratch_root is not None else output_root / "_scratch") / "_probe_mode"
+    probe_scratch.mkdir(parents=True, exist_ok=True)
+    try:
+        rgba_stack, _, _ = _render_full_sequence(probe_scene, scratch_dir=probe_scratch)
+        if _has_temporal_motion(rgba_stack):
+            return "full"
+    except Exception:
+        pass
+    return "fallback"
+
+
 if __name__ == "__main__":
-    # Main loop intentionally keeps sequence generation explicit and serial so
-    # failures can be traced to specific `sequence_id` values.
+    _ = resolve_device(verbose=True)
     args = parse_args()
     args.output_root.mkdir(parents=True, exist_ok=True)
+    chosen_mode = _choose_render_mode(args.output_root, args.scratch_root, args.render_mode)
+    print(f"Using render mode: {chosen_mode}")
 
     for seq_id in tqdm(range(args.num_sequences), desc="Generating sequences"):
         generate_sequence(
             sequence_id=seq_id,
             output_root=args.output_root,
             scratch_root=args.scratch_root,
+            render_mode=chosen_mode,
         )
 
     print(

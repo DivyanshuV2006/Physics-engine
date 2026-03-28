@@ -20,6 +20,20 @@ occlusion supervision.
 """
 
 
+def resolve_device(verbose: bool = True) -> torch.device:
+    """Selects CUDA by default and falls back to CPU when unavailable."""
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        if verbose:
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"[Device] Using CUDA: {gpu_name}")
+        return device
+    device = torch.device("cpu")
+    if verbose:
+        print("[Device] CUDA not found. Using CPU.")
+    return device
+
+
 class DummyVAEEncoder(nn.Module):
     """Mock image encoder used as a stand-in for a real VAE encoder.
 
@@ -80,6 +94,8 @@ class KubricOcclusionDataset(Dataset):
         latent_channels: int = 32,
         image_size: int = 128,
         use_tqdm: bool = False,
+        device: torch.device | str | None = None,
+        verbose_device: bool = False,
     ) -> None:
         """Initializes dataset paths, settings, and mock encoder."""
         super().__init__()
@@ -88,8 +104,10 @@ class KubricOcclusionDataset(Dataset):
         self.image_size = image_size
         self.latent_channels = latent_channels
         self.use_tqdm = use_tqdm
+        self.device = torch.device(device) if device is not None else resolve_device(verbose=verbose_device)
 
         self.encoder = DummyVAEEncoder(in_channels=3, latent_channels=latent_channels)
+        self.encoder.to(self.device)
         self.encoder.eval()
 
         self.sequences = self._discover_sequences(root_dir)
@@ -164,8 +182,8 @@ class KubricOcclusionDataset(Dataset):
     def _encode_image(self, rgb_tensor: torch.Tensor) -> torch.Tensor:
         """Encodes one RGB frame into latent space using the dummy encoder."""
         with torch.no_grad():
-            z = self.encoder(rgb_tensor.unsqueeze(0))  # [1, C, H, W]
-        return z.squeeze(0)  # [C, H, W]
+            z = self.encoder(rgb_tensor.unsqueeze(0).to(self.device))  # [1, C, H, W]
+        return z.squeeze(0).cpu()  # [C, H, W]
 
     def _mock_trajectory(self) -> torch.Tensor:
         """Creates a simple horizontal straight-line trajectory in normalized coords."""
