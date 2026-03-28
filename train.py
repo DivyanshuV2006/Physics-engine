@@ -102,6 +102,10 @@ def train(args: argparse.Namespace) -> None:
             f"mask_loss={epoch_mask_loss / num_batches:.6f} | "
             f"total_loss={epoch_total_loss / num_batches:.6f}"
         )
+    # Save the final model weights so the professor can send them back to you
+    output_path = "depth_routed_latent_world_model.pt"
+    torch.save(model.state_dict(), output_path)
+    print(f"\nTraining complete. Weights saved to {output_path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,3 +128,4 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     train(parse_args())
+    

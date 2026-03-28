@@ -6,10 +6,16 @@ torchvision>=0.15.0
 
 # Data Generation & Processing
 # Why: Numerical array backbone for depth and segmentation map handling.
-numpy>=1.24.0
+# Pin to NumPy 1.x because Kubric/TensorFlow binaries in the base image are
+# compiled against the NumPy 1.x C-API and fail with NumPy 2.x.
+numpy>=1.24.0,<1.25.0
 # Why: Lightweight image I/O used for PNG frame export.
 imageio>=2.31.0
 
 # Training Utilities
 # Why: Progress bars for long-running generation/training loops.
 tqdm>=4.65.0
+
+# Kubric transitively imports TensorFlow in this base image; TensorFlow's
+# bundled generated protos require protobuf 3.20.x (newer versions break import).
+protobuf>=3.20.0,<3.21.0
