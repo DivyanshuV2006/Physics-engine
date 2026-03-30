@@ -51,9 +51,10 @@ def train(args: argparse.Namespace) -> None:
     )
     effective_num_workers = args.num_workers
     if dataset.preload_full_cache and effective_num_workers > 0:
-        # Prevent each worker from duplicating the full RAM cache.
-        print("Full dataset cache enabled; setting DataLoader num_workers=0 to avoid cache duplication.")
-        effective_num_workers = 0
+        print(
+            "Full dataset cache + multi-worker loading enabled. "
+            "This maximizes throughput on large-memory systems."
+        )
     loader_kwargs = {
         "dataset": dataset,
         "batch_size": args.batch_size,
