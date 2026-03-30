@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+from datetime import datetime, timedelta
+import time
 
 import torch
 from torch import nn
@@ -66,7 +68,9 @@ def train(args: argparse.Namespace) -> None:
     mask_loss_fn = nn.BCELoss()
 
     model.train()
+    train_start_time = time.time()
     for epoch in range(args.epochs):
+        epoch_start_time = time.time()
         epoch_latent_loss = 0.0
         epoch_mask_loss = 0.0
         epoch_total_loss = 0.0
@@ -108,11 +112,19 @@ def train(args: argparse.Namespace) -> None:
                     )
 
         num_batches = len(loader)
+        epoch_elapsed = time.time() - epoch_start_time
+        total_elapsed = time.time() - train_start_time
+        avg_epoch_time = total_elapsed / (epoch + 1)
+        remaining_epochs = args.epochs - (epoch + 1)
+        eta_seconds = max(0.0, avg_epoch_time * remaining_epochs)
+        eta_clock = datetime.now() + timedelta(seconds=eta_seconds)
         print(
             f"Epoch {epoch + 1}/{args.epochs} | "
             f"latent_loss={epoch_latent_loss / num_batches:.6f} | "
             f"mask_loss={epoch_mask_loss / num_batches:.6f} | "
-            f"total_loss={epoch_total_loss / num_batches:.6f}"
+            f"total_loss={epoch_total_loss / num_batches:.6f} | "
+            f"epoch_time={epoch_elapsed:.1f}s | "
+            f"eta={eta_seconds/60.0:.1f}m (finishes ~ {eta_clock.strftime('%H:%M:%S')})"
         )
     # Save the final model weights so the professor can send them back to you
     output_path = "depth_routed_latent_world_model.pt"

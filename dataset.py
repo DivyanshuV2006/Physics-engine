@@ -217,5 +217,5 @@ class KubricOcclusionDataset(Dataset):
             "depth_map": depth_map.float(),
             "trajectory": trajectory.float(),
             "target_z": target_z.float(),
-            "target_mask": target_mask.float(),
+            "target_mask": target_mask.float() / 255,
         }
