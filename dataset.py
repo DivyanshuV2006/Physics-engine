@@ -80,6 +80,7 @@ class KubricOcclusionDataset(Dataset):
         latent_channels: int = 32,
         image_size: int = 128,
         use_tqdm: bool = False,
+        preload_depth_cache: bool = False,
     ) -> None:
         """Initializes dataset paths, settings, and mock encoder."""
         super().__init__()
@@ -88,6 +89,7 @@ class KubricOcclusionDataset(Dataset):
         self.image_size = image_size
         self.latent_channels = latent_channels
         self.use_tqdm = use_tqdm
+        self.preload_depth_cache = preload_depth_cache
 
         self.encoder = DummyVAEEncoder(in_channels=3, latent_channels=latent_channels)
         self.encoder.eval()
@@ -98,6 +100,24 @@ class KubricOcclusionDataset(Dataset):
                 f"No valid sequences found under '{root_dir}'. "
                 "Each scene folder must contain rgba_*.png, depth_*.npy, and mask_*.png."
             )
+
+        # Optional RAM preload of all depth arrays to reduce per-iteration disk I/O.
+        # This mirrors the requested "load all arrays before epoch 1 starts" behavior.
+        self.cache = []
+        self._depth_cache = {}
+        if self.preload_depth_cache:
+            depth_files = []
+            for seq in self.sequences:
+                depth_files.extend(seq["depth"])
+            # Deduplicate while preserving deterministic order.
+            depth_files = list(dict.fromkeys(depth_files))
+            iterator = depth_files
+            if self.use_tqdm:
+                iterator = tqdm(depth_files, desc="Preloading depth cache", leave=False)
+            for file in iterator:
+                arr = np.load(file).astype(np.float32)
+                self.cache.append(arr)
+                self._depth_cache[file] = arr
 
     @staticmethod
     def _sorted_files(scene_dir: str, pattern: str) -> List[str]:
@@ -151,6 +171,15 @@ class KubricOcclusionDataset(Dataset):
             depth = depth[..., 0]
         return torch.from_numpy(depth).unsqueeze(0)  # [1, H, W]
 
+    def _load_depth_maybe_cached(self, path: str) -> torch.Tensor:
+        """Loads depth from RAM cache when enabled; falls back to disk otherwise."""
+        if self.preload_depth_cache and path in self._depth_cache:
+            depth = self._depth_cache[path]
+            if depth.ndim == 3:
+                depth = depth[..., 0]
+            return torch.from_numpy(depth).unsqueeze(0)
+        return self._load_depth(path)
+
     @staticmethod
     def _load_mask(path: str, out_h: int, out_w: int) -> torch.Tensor:
         """Loads a binary mask and resizes with nearest-neighbor to preserve labels."""
@@ -191,7 +220,7 @@ class KubricOcclusionDataset(Dataset):
         latent_h, latent_w = z_0.shape[-2], z_0.shape[-1]
 
         # depth_map from first depth frame, resized to latent resolution.
-        depth_map = self._load_depth(depth_files[0]).unsqueeze(0)  # [1, 1, H, W]
+        depth_map = self._load_depth_maybe_cached(depth_files[0]).unsqueeze(0)  # [1, 1, H, W]
         depth_map = F.interpolate(depth_map, size=(latent_h, latent_w), mode="bilinear", align_corners=True)
         depth_map = depth_map.squeeze(0)  # [1, H, W]
 

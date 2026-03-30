@@ -46,6 +46,7 @@ def train(args: argparse.Namespace) -> None:
         latent_channels=args.latent_channels,
         image_size=args.image_size,
         use_tqdm=not args.disable_tqdm,
+        preload_depth_cache=True,
     )
     loader = DataLoader(
         dataset,
@@ -54,6 +55,7 @@ def train(args: argparse.Namespace) -> None:
         num_workers=args.num_workers,
         pin_memory=True,
         prefetch_factor=2,
+        persistent_workers=True
     )
 
     model = DepthRoutedLatentWorldModel(
@@ -68,69 +70,75 @@ def train(args: argparse.Namespace) -> None:
     # BCE supervises binary visibility probabilities for occlusion masks.
     mask_loss_fn = nn.BCELoss()
 
+    output_path = "depth_routed_latent_world_model.pt"
     model.train()
     train_start_time = time.time()
-    for epoch in range(args.epochs):
-        epoch_start_time = time.time()
-        epoch_latent_loss = 0.0
-        epoch_mask_loss = 0.0
-        epoch_total_loss = 0.0
+    try:
+        for epoch in range(args.epochs):
+            epoch_start_time = time.time()
+            epoch_latent_loss = 0.0
+            epoch_mask_loss = 0.0
+            epoch_total_loss = 0.0
 
-        progress_ctx = (
-            tqdm(loader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=False)
-            if not args.disable_tqdm
-            else nullcontext(loader)
-        )
-        with progress_ctx as progress:
-            for batch in progress:
-                z_0 = batch["z_0"].to(device)  # [B, C, H, W]
-                depth_map = batch["depth_map"].to(device)  # [B, 1, H, W]
-                trajectory = batch["trajectory"].to(device)  # [B, T, 2]
-                target_z = batch["target_z"].to(device)  # [B, T, C, H, W]
-                target_mask = batch["target_mask"].to(device)  # [B, T, 1, H, W]
+            progress_ctx = (
+                tqdm(loader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=False)
+                if not args.disable_tqdm
+                else nullcontext(loader)
+            )
+            with progress_ctx as progress:
+                for batch in progress:
+                    z_0 = batch["z_0"].to(device)  # [B, C, H, W]
+                    depth_map = batch["depth_map"].to(device)  # [B, 1, H, W]
+                    trajectory = batch["trajectory"].to(device)  # [B, T, 2]
+                    target_z = batch["target_z"].to(device)  # [B, T, C, H, W]
+                    target_mask = batch["target_mask"].to(device)  # [B, T, 1, H, W]
 
-                optimizer.zero_grad(set_to_none=True)
-                z_hat, mask_hat = model(z_0=z_0, depth_map=depth_map, trajectory=trajectory)
+                    optimizer.zero_grad(set_to_none=True)
+                    z_hat, mask_hat = model(z_0=z_0, depth_map=depth_map, trajectory=trajectory)
 
-                latent_loss = latent_loss_fn(z_hat, target_z)
-                # Clamp avoids numerical issues in BCE with exact 0/1 probabilities.
-                mask_hat_clamped = mask_hat.clamp(min=1e-4, max=1.0 - 1e-4)
-                mask_loss = mask_loss_fn(mask_hat_clamped, target_mask)
-                total_loss = latent_loss + mask_loss
+                    latent_loss = latent_loss_fn(z_hat, target_z)
+                    # Clamp avoids numerical issues in BCE with exact 0/1 probabilities.
+                    mask_hat_clamped = mask_hat.clamp(min=1e-4, max=1.0 - 1e-4)
+                    mask_loss = mask_loss_fn(mask_hat_clamped, target_mask)
+                    total_loss = latent_loss + mask_loss
 
-                total_loss.backward()
-                optimizer.step()
+                    total_loss.backward()
+                    optimizer.step()
 
-                epoch_latent_loss += latent_loss.item()
-                epoch_mask_loss += mask_loss.item()
-                epoch_total_loss += total_loss.item()
+                    epoch_latent_loss += latent_loss.item()
+                    epoch_mask_loss += mask_loss.item()
+                    epoch_total_loss += total_loss.item()
 
-                if not args.disable_tqdm:
-                    progress.set_postfix(
-                        latent_loss=f"{latent_loss.item():.4f}",
-                        mask_loss=f"{mask_loss.item():.4f}",
-                        total_loss=f"{total_loss.item():.4f}",
-                    )
+                    if not args.disable_tqdm:
+                        progress.set_postfix(
+                            latent_loss=f"{latent_loss.item():.4f}",
+                            mask_loss=f"{mask_loss.item():.4f}",
+                            total_loss=f"{total_loss.item():.4f}",
+                        )
 
-        num_batches = len(loader)
-        epoch_elapsed = time.time() - epoch_start_time
-        total_elapsed = time.time() - train_start_time
-        avg_epoch_time = total_elapsed / (epoch + 1)
-        remaining_epochs = args.epochs - (epoch + 1)
-        eta_seconds = max(0.0, avg_epoch_time * remaining_epochs)
-        eta_clock = datetime.now() + timedelta(seconds=eta_seconds)
-        print(
-            f"Epoch {epoch + 1}/{args.epochs} | "
-            f"latent_loss={epoch_latent_loss / num_batches:.6f} | "
-            f"mask_loss={epoch_mask_loss / num_batches:.6f} | "
-            f"total_loss={epoch_total_loss / num_batches:.6f} | "
-            f"epoch_time={epoch_elapsed:.1f}s | "
-            f"eta={eta_seconds/60.0:.1f}m (finishes ~ {eta_clock.strftime('%H:%M:%S')})"
-        )
-    # Save the final model weights so the professor can send them back to you
-    output_path = "depth_routed_latent_world_model.pt"
-    torch.save(model.state_dict(), output_path)
-    print(f"\nTraining complete. Weights saved to {output_path}")
+            num_batches = len(loader)
+            epoch_elapsed = time.time() - epoch_start_time
+            total_elapsed = time.time() - train_start_time
+            avg_epoch_time = total_elapsed / (epoch + 1)
+            remaining_epochs = args.epochs - (epoch + 1)
+            eta_seconds = max(0.0, avg_epoch_time * remaining_epochs)
+            eta_clock = datetime.now() + timedelta(seconds=eta_seconds)
+            print(
+                f"Epoch {epoch + 1}/{args.epochs} | "
+                f"latent_loss={epoch_latent_loss / num_batches:.6f} | "
+                f"mask_loss={epoch_mask_loss / num_batches:.6f} | "
+                f"total_loss={epoch_total_loss / num_batches:.6f} | "
+                f"epoch_time={epoch_elapsed:.1f}s | "
+                f"eta={eta_seconds/60.0:.1f}m (finishes ~ {eta_clock.strftime('%H:%M:%S')})"
+            )
+
+        torch.save(model.state_dict(), output_path)
+        print(f"\nTraining complete. Weights saved to {output_path}")
+    except KeyboardInterrupt:
+        # Save partial training progress if the user interrupts (e.g. Ctrl+C).
+        torch.save(model.state_dict(), output_path)
+        print(f"\nTraining interrupted. Partial weights saved to {output_path}")
+        return
 
 
 def parse_args() -> argparse.Namespace:
