@@ -6,10 +6,12 @@ __pycache__/
 
 # Ignore local virtual env and secrets/environment files from host machine.
 .venv/
+.venv311/
 .env
 
 # Ignore generated data and model artifacts to keep Docker builds fast/stable.
 dataset/
+dataset_smoke/
 *.npy
 *.pt
 *.safetensors

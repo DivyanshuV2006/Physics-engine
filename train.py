@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 
 import torch
 from torch import nn
@@ -9,7 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import KubricOcclusionDataset
-from model import DepthRoutedLatentWorldModel, resolve_device
+from model import DepthRoutedLatentWorldModel
 
 """Training entrypoint for the depth-routed latent world model.
 
@@ -30,7 +31,12 @@ def train(args: argparse.Namespace) -> None:
         Joint optimization encourages both appearance consistency and explicit
         occlusion reasoning, which is central to object permanence.
     """
-    device = resolve_device(verbose=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
+        print(f"Using GPU: {gpu_name}")
+    else:
+        print("Using CPU (CUDA not available).")
 
     dataset = KubricOcclusionDataset(
         root_dir=args.data_root,
@@ -38,8 +44,6 @@ def train(args: argparse.Namespace) -> None:
         latent_channels=args.latent_channels,
         image_size=args.image_size,
         use_tqdm=not args.disable_tqdm,
-        device=device,
-        verbose_device=False,
     )
     loader = DataLoader(
         dataset,
@@ -53,8 +57,6 @@ def train(args: argparse.Namespace) -> None:
         latent_channels=args.latent_channels,
         slot_dim=args.slot_dim,
         use_tqdm=args.model_tqdm and not args.disable_tqdm,
-        device=device,
-        verbose_device=False,
     ).to(device)
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -69,35 +71,41 @@ def train(args: argparse.Namespace) -> None:
         epoch_mask_loss = 0.0
         epoch_total_loss = 0.0
 
-        progress = tqdm(loader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=False)
-        for batch in progress:
-            z_0 = batch["z_0"].to(device)  # [B, C, H, W]
-            depth_map = batch["depth_map"].to(device)  # [B, 1, H, W]
-            trajectory = batch["trajectory"].to(device)  # [B, T, 2]
-            target_z = batch["target_z"].to(device)  # [B, T, C, H, W]
-            target_mask = batch["target_mask"].to(device)  # [B, T, 1, H, W]
+        progress_ctx = (
+            tqdm(loader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=False)
+            if not args.disable_tqdm
+            else nullcontext(loader)
+        )
+        with progress_ctx as progress:
+            for batch in progress:
+                z_0 = batch["z_0"].to(device)  # [B, C, H, W]
+                depth_map = batch["depth_map"].to(device)  # [B, 1, H, W]
+                trajectory = batch["trajectory"].to(device)  # [B, T, 2]
+                target_z = batch["target_z"].to(device)  # [B, T, C, H, W]
+                target_mask = batch["target_mask"].to(device)  # [B, T, 1, H, W]
 
-            optimizer.zero_grad(set_to_none=True)
-            z_hat, mask_hat = model(z_0=z_0, depth_map=depth_map, trajectory=trajectory)
+                optimizer.zero_grad(set_to_none=True)
+                z_hat, mask_hat = model(z_0=z_0, depth_map=depth_map, trajectory=trajectory)
 
-            latent_loss = latent_loss_fn(z_hat, target_z)
-            # Clamp avoids numerical issues in BCE with exact 0/1 probabilities.
-            mask_hat_clamped = mask_hat.clamp(min=1e-4, max=1.0 - 1e-4)
-            mask_loss = mask_loss_fn(mask_hat_clamped, target_mask)
-            total_loss = latent_loss + mask_loss
+                latent_loss = latent_loss_fn(z_hat, target_z)
+                # Clamp avoids numerical issues in BCE with exact 0/1 probabilities.
+                mask_hat_clamped = mask_hat.clamp(min=1e-4, max=1.0 - 1e-4)
+                mask_loss = mask_loss_fn(mask_hat_clamped, target_mask)
+                total_loss = latent_loss + mask_loss
 
-            total_loss.backward()
-            optimizer.step()
+                total_loss.backward()
+                optimizer.step()
 
-            epoch_latent_loss += latent_loss.item()
-            epoch_mask_loss += mask_loss.item()
-            epoch_total_loss += total_loss.item()
+                epoch_latent_loss += latent_loss.item()
+                epoch_mask_loss += mask_loss.item()
+                epoch_total_loss += total_loss.item()
 
-            progress.set_postfix(
-                latent_loss=f"{latent_loss.item():.4f}",
-                mask_loss=f"{mask_loss.item():.4f}",
-                total_loss=f"{total_loss.item():.4f}",
-            )
+                if not args.disable_tqdm:
+                    progress.set_postfix(
+                        latent_loss=f"{latent_loss.item():.4f}",
+                        mask_loss=f"{mask_loss.item():.4f}",
+                        total_loss=f"{total_loss.item():.4f}",
+                    )
 
         num_batches = len(loader)
         print(

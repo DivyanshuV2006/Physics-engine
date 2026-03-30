@@ -1,53 +1,44 @@
-# Depth-Routed Latent World Model
+# Physics-engine
+## Project Description
 
-This repository contains the official PyTorch implementation and synthetic dataset generation pipeline for the **Depth-Routed Latent World Model**. 
+This project is a synthetic dataset generator using the [Kubric](https://github.com/google-research/kubric) physics engine and PyTorch. It creates and processes scenes with occluded objects, producing data useful for computer vision tasks such as occlusion reasoning and depth estimation.
 
-This project explores a novel architecture for 3D object permanence in neural networks. By integrating explicit depth-map routing and differentiable visibility masking into a latent dynamics model, the network learns to track moving objects even when they are 100% occluded by foreground geometry.
+**Features:**
+- Generates scenes with RGB(A) images, depth maps, and binary masks.
+- Provides a PyTorch `Dataset` class for easy integration with machine learning workflows.
+- Includes a simple convolutional VAE encoder for image-to-latent representations.
+- Designed for GPU-accelerated environments via Docker and NVIDIA runtime.
 
-## 🧠 Core Architecture
+**How to use:**
+1. Place your synthetic scene directories in the required structure.
+2. Use the provided Dockerfile to build the reproducible environment.
+3. Run the generator using Docker Compose.
 
-Traditional latent world models struggle with object permanence because they rely purely on spatial reconstruction. When an object is occluded, its pixels disappear, often causing the model's recurrent state to "forget" the object entirely. 
+**Requirements:**
+- Python (with numpy, torch, PIL, tqdm)
+- Docker with NVIDIA GPU support
+- Kubric SDK
 
-This architecture solves this by enforcing geometric visibility rules on the latent features:
+See `dataset.py` for the dataset implementation and usage details.
 
-1. **Slot Extractor:** A lightweight CNN encoder compresses the initial visual observation (`z_0`) into a persistent latent slot and predicts a scalar relative depth for the object.
-2. **Physics RNN:** A trajectory-conditioned GRU cell evolves the latent slot across time, tracking the object's physical dynamics independently of its visibility.
-3. **Differentiable Depth Router:** The core innovation. The model samples the static background depth map at the object's current trajectory coordinates and compares it to the object's predicted depth. A steep sigmoid function acts as a differentiable visibility gate, dropping the output to 0.0 when the object is geometrically behind the foreground.
-4. **Spatial Broadcast Decoder:** The routed latent state is explicitly broadcast across an XY coordinate grid to reconstruct the predicted spatial latent maps and binary occlusion masks.
+## File-by-file design notes (what/how/why)
 
-## 🗄️ The Kubric Occlusion Dataset
+- `dataset-generator.py`
+  - **What:** Generates Kubric sequences with RGB, depth, and binary target masks.
+  - **How:** Builds a fixed scene graph, animates a target object, renders all frames, and exports frame-wise artifacts.
+  - **Why:** Produces controlled occlusion-heavy data for object permanence experiments.
 
-To mathematically isolate and prove the depth-routing logic, this repository includes a custom, containerized physics pipeline built on Google's **Kubric** engine. 
+- `dataset.py`
+  - **What:** Loads synthetic sequences and returns model-ready tensors.
+  - **How:** Discovers valid folders, encodes RGB into latents, resizes depth/mask maps, and emits a mock trajectory.
+  - **Why:** Keeps training input preparation consistent and centralized.
 
-The current dataset generator outputs a controlled scenario: a dynamic target sphere passing horizontally behind a static foreground occluder (wall). 
+- `model.py`
+  - **What:** Implements the depth-routed latent world model architecture.
+  - **How:** Extracts a slot from `z_0`, rolls it with GRU over trajectory, applies depth-based visibility routing, and decodes latents.
+  - **Why:** Enforces physically plausible occlusion behavior in temporal latent prediction.
 
-The pipeline strictly exports three modalities per sequence to enforce multi-objective supervision:
-* `rgba_*.png`: The visual input.
-* `depth_*.npy`: Uncompressed float32 arrays preserving exact sub-pixel depth measurements.
-* `mask_*.png`: Binary visibility targets for the BCE occlusion loss.
-
-## 🚀 Quick Start
-
-### 1. Data Generation (Docker)
-The dataset generation relies on Blender's rendering engine and is containerized to prevent dependency conflicts. 
-
-Generate the data locally using the provided Docker environment:
-```bash
-docker run --rm -v "${PWD}:/workspace" kubricdocker/kubric python /workspace/dataset-generator.py --output-root dataset --num-sequences 2000
-```
-
-### 2. Training (Local or Cloud GPU)
-The training loop is purely PyTorch and does not require Kubric. It includes automatic epoch checkpointing to survive preemptible cloud instances (like Google Colab).
-
-Install dependencies and execute the training loop:
-```bash
-pip install -r requirements.txt
-python train.py --data-root dataset --epochs 20 --batch-size 32
-```
-
-## 🗺️ Roadmap & Future Work
-
-This codebase currently serves as a foundational proof-of-concept for the core depth-routing mathematics. During the upcoming summer break, this architecture will be scaled significantly:
-* **Complex Mesh Integration:** Swapping the primitive spherical targets for high-fidelity `.obj` and `.gltf` assets.
-* **Dynamic Occluders:** Training the network to route depth against moving foreground elements rather than a static environment.
-* **Compute Scaling:** Transitioning the data generation and training loops from a local environment to a dedicated multi-GPU compute cluster.
+- `train.py`
+  - **What:** Runs end-to-end training.
+  - **How:** Creates dataloader/model/optimizer, computes latent MSE + mask BCE losses, and updates weights each step.
+  - **Why:** Provides a reproducible baseline training entrypoint.
