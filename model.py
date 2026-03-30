@@ -144,7 +144,7 @@ class DepthRoutedLatentWorldModel(nn.Module):
         depth_map: [B, 1, H, W]
         trajectory_t: [B, 2]
         slot_depth: [B, 1]
-        Returns visible mask scalar per sample: [B, 1], float in {0, 1}
+        Returns visibility logit per sample: [B, 1]
         """
         grid = trajectory_t.view(trajectory_t.shape[0], 1, 1, 2)  # [B, 1, 1, 2]
         bg_depth = F.grid_sample(
@@ -155,13 +155,38 @@ class DepthRoutedLatentWorldModel(nn.Module):
             align_corners=True,
         ).view(trajectory_t.shape[0], 1)  # [B, 1]
 
-        # Visible if object depth is in front of (or equal to) sampled background depth.
-        # Differentiable soft-routing using a steep sigmoid
-        # bg_depth > slot_depth -> positive -> sigmoid approaches 1.0 (visible)
-        # bg_depth < slot_depth -> negative -> sigmoid approaches 0.0 (occluded)
-        temperature = 1.0 
-        visible = torch.sigmoid((bg_depth - slot_depth) * temperature) # [B, 1]
-        return visible
+        # Positive logit => visible; negative logit => occluded.
+        temperature = 8.0
+        visible_logit = (bg_depth - slot_depth) * temperature  # [B, 1]
+        return visible_logit
+
+    @staticmethod
+    def _spatial_stamp_logits(
+        trajectory_t: torch.Tensor,
+        height: int,
+        width: int,
+        sigma: float = 0.18,
+    ) -> torch.Tensor:
+        """Creates a per-step Gaussian spatial object prior in logit space.
+
+        trajectory_t: [B, 2] normalized coordinates in [-1, 1]
+        returns: [B, 1, H, W] logits
+        """
+        batch_size = trajectory_t.shape[0]
+        y_coords = torch.linspace(-1.0, 1.0, steps=height, device=trajectory_t.device, dtype=trajectory_t.dtype)
+        x_coords = torch.linspace(-1.0, 1.0, steps=width, device=trajectory_t.device, dtype=trajectory_t.dtype)
+        yy, xx = torch.meshgrid(y_coords, x_coords, indexing="ij")
+        yy = yy.unsqueeze(0).expand(batch_size, -1, -1)  # [B, H, W]
+        xx = xx.unsqueeze(0).expand(batch_size, -1, -1)  # [B, H, W]
+
+        cx = trajectory_t[:, 0].view(batch_size, 1, 1)  # [B,1,1]
+        cy = trajectory_t[:, 1].view(batch_size, 1, 1)  # [B,1,1]
+        dist2 = (xx - cx) ** 2 + (yy - cy) ** 2  # [B,H,W]
+
+        spatial_prob = torch.exp(-dist2 / (2.0 * (sigma ** 2)))
+        spatial_prob = spatial_prob.clamp(min=1e-4, max=1.0 - 1e-4)
+        spatial_logits = torch.logit(spatial_prob).unsqueeze(1)  # [B,1,H,W]
+        return spatial_logits
 
     def forward(
         self, z_0: torch.Tensor, depth_map: torch.Tensor, trajectory: torch.Tensor
@@ -196,14 +221,21 @@ class DepthRoutedLatentWorldModel(nn.Module):
             traj_t = trajectory[:, t, :]  # [B, 2]
             hidden = self.physics_rnn(traj_t, hidden)  # [B, slot_dim]
 
-            visible_scalar = self._route_depth(depth_map, traj_t, slot_depth)  # [B, 1]
-            mask_t = visible_scalar.view(batch_size, 1, 1, 1).expand(-1, 1, height, width)  # [B,1,H,W]
+            visible_logit = self._route_depth(depth_map, traj_t, slot_depth)  # [B, 1]
+            visible_alpha = torch.sigmoid(visible_logit).view(batch_size, 1, 1, 1)  # [B,1,1,1]
+
+            spatial_logits = self._spatial_stamp_logits(traj_t, height=height, width=width)  # [B,1,H,W]
+            spatial_alpha = torch.sigmoid(spatial_logits)  # [B,1,H,W]
+
+            # Visibility scalar acts as intensity/alpha over a spatial object stamp.
+            mask_prob = (visible_alpha * spatial_alpha).clamp(min=1e-4, max=1.0 - 1e-4)  # [B,1,H,W]
+            mask_logits = torch.logit(mask_prob)  # [B,1,H,W]
 
             rendered_t = self.renderer(hidden, height, width)  # [B, C, H, W]
-            routed_t = rendered_t * mask_t  # [B, C, H, W]
+            routed_t = rendered_t * mask_prob  # [B, C, H, W]
 
             z_seq.append(routed_t)
-            m_seq.append(mask_t)
+            m_seq.append(mask_logits)
 
         z_hat = torch.stack(z_seq, dim=1)  # [B, T, C, H, W]
         mask_hat = torch.stack(m_seq, dim=1)  # [B, T, 1, H, W]

@@ -106,8 +106,9 @@ def train(args: argparse.Namespace) -> None:
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     # MSE supervises continuous latent reconstruction quality.
     latent_loss_fn = nn.MSELoss()
-    # BCE supervises binary visibility probabilities for occlusion masks.
-    mask_loss_fn = nn.BCELoss()
+    # Weighted logits BCE strongly penalizes missing sparse foreground pixels.
+    pos_weight = torch.tensor([150.0], device=device)
+    mask_loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     output_path = "depth_routed_latent_world_model.pt"
     model.train()
@@ -133,12 +134,10 @@ def train(args: argparse.Namespace) -> None:
                     target_mask = batch["target_mask"].to(device)  # [B, T, 1, H, W]
 
                     optimizer.zero_grad(set_to_none=True)
-                    z_hat, mask_hat = model(z_0=z_0, depth_map=depth_map, trajectory=trajectory)
+                    z_hat, mask_logits = model(z_0=z_0, depth_map=depth_map, trajectory=trajectory)
 
                     latent_loss = latent_loss_fn(z_hat, target_z)
-                    # Clamp avoids numerical issues in BCE with exact 0/1 probabilities.
-                    mask_hat_clamped = mask_hat.clamp(min=1e-4, max=1.0 - 1e-4)
-                    mask_loss = mask_loss_fn(mask_hat_clamped, target_mask)
+                    mask_loss = mask_loss_fn(mask_logits, target_mask)
                     total_loss = latent_loss + mask_loss
 
                     total_loss.backward()
@@ -180,10 +179,9 @@ def train(args: argparse.Namespace) -> None:
                             target_z = batch["target_z"].to(device)
                             target_mask = batch["target_mask"].to(device)
 
-                            z_hat, mask_hat = model(z_0=z_0, depth_map=depth_map, trajectory=trajectory)
+                            z_hat, mask_logits = model(z_0=z_0, depth_map=depth_map, trajectory=trajectory)
                             latent_loss = latent_loss_fn(z_hat, target_z)
-                            mask_hat_clamped = mask_hat.clamp(min=1e-4, max=1.0 - 1e-4)
-                            mask_loss = mask_loss_fn(mask_hat_clamped, target_mask)
+                            mask_loss = mask_loss_fn(mask_logits, target_mask)
                             total_loss = latent_loss + mask_loss
 
                             val_latent_loss += latent_loss.item()
