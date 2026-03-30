@@ -52,7 +52,8 @@ def train(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=True,
+        prefetch_factor=2,
     )
 
     model = DepthRoutedLatentWorldModel(
@@ -144,7 +145,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slot-dim", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--model-tqdm", action="store_true", help="Enable per-time-step model rollout tqdm")
     parser.add_argument("--disable-tqdm", action="store_true", help="Disable all tqdm progress bars")
     return parser.parse_args()
