@@ -81,6 +81,7 @@ class KubricOcclusionDataset(Dataset):
         image_size: int = 128,
         use_tqdm: bool = False,
         preload_depth_cache: bool = False,
+        preload_full_cache: bool = False,
     ) -> None:
         """Initializes dataset paths, settings, and mock encoder."""
         super().__init__()
@@ -90,6 +91,7 @@ class KubricOcclusionDataset(Dataset):
         self.latent_channels = latent_channels
         self.use_tqdm = use_tqdm
         self.preload_depth_cache = preload_depth_cache
+        self.preload_full_cache = preload_full_cache
 
         self.encoder = DummyVAEEncoder(in_channels=3, latent_channels=latent_channels)
         self.encoder.eval()
@@ -101,10 +103,46 @@ class KubricOcclusionDataset(Dataset):
                 "Each scene folder must contain rgba_*.png, depth_*.npy, and mask_*.png."
             )
 
-        # Optional RAM preload of all depth arrays to reduce per-iteration disk I/O.
-        # This mirrors the requested "load all arrays before epoch 1 starts" behavior.
+        # Optional RAM preload caches to reduce per-iteration disk I/O.
         self.cache = []
         self._depth_cache = {}
+        self._rgba_cache = {}
+        self._mask_cache = {}
+
+        if self.preload_full_cache:
+            rgba_files = []
+            depth_files = []
+            mask_files = []
+            for seq in self.sequences:
+                rgba_files.extend(seq["rgba"])
+                depth_files.extend(seq["depth"])
+                mask_files.extend(seq["mask"])
+
+            rgba_files = list(dict.fromkeys(rgba_files))
+            depth_files = list(dict.fromkeys(depth_files))
+            mask_files = list(dict.fromkeys(mask_files))
+
+            rgba_iter = rgba_files
+            depth_iter = depth_files
+            mask_iter = mask_files
+            if self.use_tqdm:
+                rgba_iter = tqdm(rgba_files, desc="Preloading RGBA cache", leave=False)
+                depth_iter = tqdm(depth_files, desc="Preloading depth cache", leave=False)
+                mask_iter = tqdm(mask_files, desc="Preloading mask cache", leave=False)
+
+            for file in rgba_iter:
+                rgb_t = self._load_rgba_as_rgb_tensor_uncached(file)
+                self._rgba_cache[file] = rgb_t
+                self.cache.append(rgb_t)
+            for file in depth_iter:
+                arr = np.load(file).astype(np.float32)
+                self._depth_cache[file] = arr
+                self.cache.append(arr)
+            for file in mask_iter:
+                arr = np.asarray(Image.open(file).convert("L"), dtype=np.uint8)
+                self._mask_cache[file] = arr
+                self.cache.append(arr)
+
         if self.preload_depth_cache:
             depth_files = []
             for seq in self.sequences:
@@ -115,9 +153,10 @@ class KubricOcclusionDataset(Dataset):
             if self.use_tqdm:
                 iterator = tqdm(depth_files, desc="Preloading depth cache", leave=False)
             for file in iterator:
-                arr = np.load(file).astype(np.float32)
-                self.cache.append(arr)
-                self._depth_cache[file] = arr
+                if file not in self._depth_cache:
+                    arr = np.load(file).astype(np.float32)
+                    self.cache.append(arr)
+                    self._depth_cache[file] = arr
 
     @staticmethod
     def _sorted_files(scene_dir: str, pattern: str) -> List[str]:
@@ -155,13 +194,18 @@ class KubricOcclusionDataset(Dataset):
         """Number of discovered sequence folders."""
         return len(self.sequences)
 
-    def _load_rgba_as_rgb_tensor(self, path: str) -> torch.Tensor:
+    def _load_rgba_as_rgb_tensor_uncached(self, path: str) -> torch.Tensor:
         """Loads an RGBA PNG, drops alpha, normalizes to [0, 1], returns CHW."""
         img = Image.open(path).convert("RGBA").resize((self.image_size, self.image_size), Image.BILINEAR)
         rgba = np.asarray(img, dtype=np.float32) / 255.0  # [H, W, 4]
         rgb = rgba[..., :3]
         tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous()  # [3, H, W]
         return tensor
+
+    def _load_rgba_as_rgb_tensor(self, path: str) -> torch.Tensor:
+        if self.preload_full_cache and path in self._rgba_cache:
+            return self._rgba_cache[path]
+        return self._load_rgba_as_rgb_tensor_uncached(path)
 
     @staticmethod
     def _load_depth(path: str) -> torch.Tensor:
@@ -181,14 +225,19 @@ class KubricOcclusionDataset(Dataset):
         return self._load_depth(path)
 
     @staticmethod
-    def _load_mask(path: str, out_h: int, out_w: int) -> torch.Tensor:
-        """Loads a binary mask and resizes with nearest-neighbor to preserve labels."""
-        mask = Image.open(path).convert("L")
-        mask_np = np.asarray(mask, dtype=np.uint8)
+    def _load_mask_from_array(mask_np: np.ndarray, out_h: int, out_w: int) -> torch.Tensor:
         mask_bin = (mask_np > 127).astype(np.float32)  # [H, W], binary
         mask_t = torch.from_numpy(mask_bin).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
         mask_t = F.interpolate(mask_t, size=(out_h, out_w), mode="nearest")
         return mask_t.squeeze(0)  # [1, H, W]
+
+    def _load_mask(self, path: str, out_h: int, out_w: int) -> torch.Tensor:
+        """Loads a binary mask and resizes with nearest-neighbor to preserve labels."""
+        if self.preload_full_cache and path in self._mask_cache:
+            return self._load_mask_from_array(self._mask_cache[path], out_h=out_h, out_w=out_w)
+        mask = Image.open(path).convert("L")
+        mask_np = np.asarray(mask, dtype=np.uint8)
+        return self._load_mask_from_array(mask_np, out_h=out_h, out_w=out_w)
 
     def _encode_image(self, rgb_tensor: torch.Tensor) -> torch.Tensor:
         """Encodes one RGB frame into latent space using the dummy encoder."""

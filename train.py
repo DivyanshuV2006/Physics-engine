@@ -47,16 +47,24 @@ def train(args: argparse.Namespace) -> None:
         image_size=args.image_size,
         use_tqdm=not args.disable_tqdm,
         preload_depth_cache=True,
+        preload_full_cache=True,
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        prefetch_factor=2,
-        persistent_workers=True
-    )
+    effective_num_workers = args.num_workers
+    if dataset.preload_full_cache and effective_num_workers > 0:
+        # Prevent each worker from duplicating the full RAM cache.
+        print("Full dataset cache enabled; setting DataLoader num_workers=0 to avoid cache duplication.")
+        effective_num_workers = 0
+    loader_kwargs = {
+        "dataset": dataset,
+        "batch_size": args.batch_size,
+        "shuffle": True,
+        "num_workers": effective_num_workers,
+        "pin_memory": True,
+        "persistent_workers": effective_num_workers > 0,
+    }
+    if effective_num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+    loader = DataLoader(**loader_kwargs)
 
     model = DepthRoutedLatentWorldModel(
         latent_channels=args.latent_channels,
