@@ -125,6 +125,13 @@ class DepthRoutedLatentWorldModel(nn.Module):
         self.slot_extractor = SlotExtractor(in_channels=latent_channels, slot_dim=slot_dim)
         self.physics_rnn = nn.GRUCell(input_size=2, hidden_size=slot_dim)
         self.renderer = SpatialBroadcastDecoder(slot_dim=slot_dim, out_channels=latent_channels)
+        self.visibility_head = nn.Sequential(
+            nn.Linear(slot_dim, slot_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(slot_dim // 2, 1),
+        )
+        # Explicit bias init for visibility branch to avoid deep-negative startup logits.
+        nn.init.constant_(self.visibility_head[-1].bias, 0.0)
         self.use_tqdm = use_tqdm
 
     @staticmethod
@@ -221,7 +228,9 @@ class DepthRoutedLatentWorldModel(nn.Module):
             traj_t = trajectory[:, t, :]  # [B, 2]
             hidden = self.physics_rnn(traj_t, hidden)  # [B, slot_dim]
 
-            visible_logit = self._route_depth(depth_map, traj_t, slot_depth)  # [B, 1]
+            depth_visible_logit = self._route_depth(depth_map, traj_t, slot_depth)  # [B, 1]
+            learned_visible_logit = self.visibility_head(hidden)  # [B, 1]
+            visible_logit = depth_visible_logit + learned_visible_logit  # [B, 1]
             visible_alpha = torch.sigmoid(visible_logit).view(batch_size, 1, 1, 1)  # [B,1,1,1]
 
             spatial_logits = self._spatial_stamp_logits(traj_t, height=height, width=width)  # [B,1,H,W]

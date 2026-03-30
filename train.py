@@ -106,8 +106,8 @@ def train(args: argparse.Namespace) -> None:
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     # MSE supervises continuous latent reconstruction quality.
     latent_loss_fn = nn.MSELoss()
-    # Weighted logits BCE strongly penalizes missing sparse foreground pixels.
-    pos_weight = torch.tensor([150.0], device=device)
+    # Weighted logits BCE penalizes missing sparse foreground pixels.
+    pos_weight = torch.tensor([40.0], device=device)
     mask_loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     output_path = "depth_routed_latent_world_model.pt"
@@ -126,6 +126,7 @@ def train(args: argparse.Namespace) -> None:
                 else nullcontext(train_loader)
             )
             with progress_ctx as progress:
+                mask_collapse_detected = False
                 for batch in progress:
                     z_0 = batch["z_0"].to(device)  # [B, C, H, W]
                     depth_map = batch["depth_map"].to(device)  # [B, 1, H, W]
@@ -136,11 +137,23 @@ def train(args: argparse.Namespace) -> None:
                     optimizer.zero_grad(set_to_none=True)
                     z_hat, mask_logits = model(z_0=z_0, depth_map=depth_map, trajectory=trajectory)
 
+                    logits_min = float(mask_logits.detach().amin().item())
+                    logits_max = float(mask_logits.detach().amax().item())
+                    if logits_min < -10.0:
+                        mask_collapse_detected = True
+                    if (not args.disable_tqdm) and (progress.n == 0 or progress.n % 50 == 0):
+                        print(
+                            f"[logits] epoch={epoch + 1} step={progress.n} "
+                            f"min={logits_min:.3f} max={logits_max:.3f}"
+                        )
+
                     latent_loss = latent_loss_fn(z_hat, target_z)
                     mask_loss = mask_loss_fn(mask_logits, target_mask)
                     total_loss = latent_loss + mask_loss
 
                     total_loss.backward()
+                    if mask_collapse_detected:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
 
                     epoch_latent_loss += latent_loss.item()
