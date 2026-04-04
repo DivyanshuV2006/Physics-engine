@@ -3,3 +3,5 @@ dataset/
 *.env
 .venv311/
 /.venv311/
+depth_routed_latent_world_model.pt
+training_convergence.png

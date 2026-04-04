@@ -104,6 +104,18 @@ def train(args: argparse.Namespace) -> None:
     ).to(device)
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt_param_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
+    tracked_modules = (
+        ("physics_rnn", model.physics_rnn),
+        ("visibility_head", model.visibility_head),
+        ("mask_offset_head", model.mask_offset_head),
+    )
+    for module_name, module in tracked_modules:
+        missing = [name for name, param in module.named_parameters() if id(param) not in opt_param_ids]
+        if missing:
+            raise RuntimeError(f"Optimizer is missing parameters for {module_name}: {missing}")
+    print("Optimizer tracking verified for physics and mask branches.")
+
     # MSE supervises continuous latent reconstruction quality.
     latent_loss_fn = nn.MSELoss()
     # Weighted logits BCE penalizes missing sparse foreground pixels.
@@ -114,13 +126,7 @@ def train(args: argparse.Namespace) -> None:
     model.train()
     train_start_time = time.time()
     try:
-        epoch_pbar = tqdm(
-            range(args.epochs),
-            desc="Epochs",
-            unit="epoch",
-            disable=args.disable_tqdm,
-        )
-        for epoch in epoch_pbar:
+        for epoch in range(args.epochs):
             epoch_start_time = time.time()
             epoch_latent_loss = 0.0
             epoch_mask_loss = 0.0
@@ -222,7 +228,7 @@ def train(args: argparse.Namespace) -> None:
             remaining_epochs = args.epochs - (epoch + 1)
             eta_seconds = max(0.0, avg_epoch_time * remaining_epochs)
             eta_clock = datetime.now() + timedelta(seconds=eta_seconds)
-            summary = (
+            print(
                 f"Epoch {epoch + 1}/{args.epochs} | "
                 f"train_latent={train_latent_avg:.6f} | "
                 f"train_mask={train_mask_avg:.6f} | "
@@ -233,20 +239,6 @@ def train(args: argparse.Namespace) -> None:
                 f"epoch_time={epoch_elapsed:.1f}s | "
                 f"eta={eta_seconds/60.0:.1f}m (finishes ~ {eta_clock.strftime('%H:%M:%S')})"
             )
-            if args.disable_tqdm:
-                print(summary)
-            else:
-                tqdm.write(summary)
-                epoch_pbar.set_postfix(
-                    tr_L=f"{train_latent_avg:.4f}",
-                    tr_M=f"{train_mask_avg:.4f}",
-                    tr_T=f"{train_total_avg:.4f}",
-                    vl_L=f"{val_latent_avg:.4f}",
-                    vl_M=f"{val_mask_avg:.4f}",
-                    vl_T=f"{val_total_avg:.4f}",
-                    sec=f"{epoch_elapsed:.0f}s",
-                    ETA=eta_clock.strftime("%H:%M:%S"),
-                )
 
         torch.save(model.state_dict(), output_path)
         print(f"\nTraining complete. Weights saved to {output_path}")

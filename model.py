@@ -130,8 +130,15 @@ class DepthRoutedLatentWorldModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(slot_dim // 2, 1),
         )
+        self.mask_offset_head = nn.Sequential(
+            nn.Linear(slot_dim, slot_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(slot_dim // 2, 3),  # dx, dy, sigma-control
+        )
         # Explicit bias init for visibility branch to avoid deep-negative startup logits.
         nn.init.constant_(self.visibility_head[-1].bias, 0.0)
+        # Start with no spatial offset and moderate Gaussian spread.
+        nn.init.constant_(self.mask_offset_head[-1].bias, 0.0)
         self.use_tqdm = use_tqdm
 
     @staticmethod
@@ -169,25 +176,27 @@ class DepthRoutedLatentWorldModel(nn.Module):
 
     @staticmethod
     def _spatial_stamp_logits(
-        trajectory_t: torch.Tensor,
+        center_t: torch.Tensor,
+        sigma_t: torch.Tensor,
         height: int,
         width: int,
-        sigma: float = 0.18,
     ) -> torch.Tensor:
         """Creates a per-step Gaussian spatial object prior in logit space.
 
-        trajectory_t: [B, 2] normalized coordinates in [-1, 1]
+        center_t: [B, 2] normalized coordinates in [-1, 1]
+        sigma_t: [B, 1] positive spread parameter in normalized coordinates
         returns: [B, 1, H, W] logits
         """
-        batch_size = trajectory_t.shape[0]
-        y_coords = torch.linspace(-1.0, 1.0, steps=height, device=trajectory_t.device, dtype=trajectory_t.dtype)
-        x_coords = torch.linspace(-1.0, 1.0, steps=width, device=trajectory_t.device, dtype=trajectory_t.dtype)
+        batch_size = center_t.shape[0]
+        y_coords = torch.linspace(-1.0, 1.0, steps=height, device=center_t.device, dtype=center_t.dtype)
+        x_coords = torch.linspace(-1.0, 1.0, steps=width, device=center_t.device, dtype=center_t.dtype)
         yy, xx = torch.meshgrid(y_coords, x_coords, indexing="ij")
         yy = yy.unsqueeze(0).expand(batch_size, -1, -1)  # [B, H, W]
         xx = xx.unsqueeze(0).expand(batch_size, -1, -1)  # [B, H, W]
 
-        cx = trajectory_t[:, 0].view(batch_size, 1, 1)  # [B,1,1]
-        cy = trajectory_t[:, 1].view(batch_size, 1, 1)  # [B,1,1]
+        cx = center_t[:, 0].view(batch_size, 1, 1)  # [B,1,1]
+        cy = center_t[:, 1].view(batch_size, 1, 1)  # [B,1,1]
+        sigma = sigma_t.view(batch_size, 1, 1).clamp(min=0.05, max=0.5)  # [B,1,1]
         dist2 = (xx - cx) ** 2 + (yy - cy) ** 2  # [B,H,W]
 
         spatial_prob = torch.exp(-dist2 / (2.0 * (sigma ** 2)))
@@ -233,7 +242,18 @@ class DepthRoutedLatentWorldModel(nn.Module):
             visible_logit = depth_visible_logit + learned_visible_logit  # [B, 1]
             visible_alpha = torch.sigmoid(visible_logit).view(batch_size, 1, 1, 1)  # [B,1,1,1]
 
-            spatial_logits = self._spatial_stamp_logits(traj_t, height=height, width=width)  # [B,1,H,W]
+            # Physics RNN controls spatial placement and spread (fully differentiable).
+            mask_params = self.mask_offset_head(hidden)  # [B, 3]
+            delta_xy = 0.20 * torch.tanh(mask_params[:, :2])  # [B, 2]
+            center_t = (traj_t + delta_xy).clamp(min=-1.0, max=1.0)  # [B, 2]
+            sigma_t = 0.10 + 0.22 * torch.sigmoid(mask_params[:, 2:3])  # [B, 1]
+
+            spatial_logits = self._spatial_stamp_logits(
+                center_t=center_t,
+                sigma_t=sigma_t,
+                height=height,
+                width=width,
+            )  # [B,1,H,W]
             spatial_alpha = torch.sigmoid(spatial_logits)  # [B,1,H,W]
 
             # Visibility scalar acts as intensity/alpha over a spatial object stamp.
