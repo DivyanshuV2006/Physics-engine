@@ -114,7 +114,13 @@ def train(args: argparse.Namespace) -> None:
     model.train()
     train_start_time = time.time()
     try:
-        for epoch in range(args.epochs):
+        epoch_pbar = tqdm(
+            range(args.epochs),
+            desc="Epochs",
+            unit="epoch",
+            disable=args.disable_tqdm,
+        )
+        for epoch in epoch_pbar:
             epoch_start_time = time.time()
             epoch_latent_loss = 0.0
             epoch_mask_loss = 0.0
@@ -216,7 +222,7 @@ def train(args: argparse.Namespace) -> None:
             remaining_epochs = args.epochs - (epoch + 1)
             eta_seconds = max(0.0, avg_epoch_time * remaining_epochs)
             eta_clock = datetime.now() + timedelta(seconds=eta_seconds)
-            print(
+            summary = (
                 f"Epoch {epoch + 1}/{args.epochs} | "
                 f"train_latent={train_latent_avg:.6f} | "
                 f"train_mask={train_mask_avg:.6f} | "
@@ -227,6 +233,20 @@ def train(args: argparse.Namespace) -> None:
                 f"epoch_time={epoch_elapsed:.1f}s | "
                 f"eta={eta_seconds/60.0:.1f}m (finishes ~ {eta_clock.strftime('%H:%M:%S')})"
             )
+            if args.disable_tqdm:
+                print(summary)
+            else:
+                tqdm.write(summary)
+                epoch_pbar.set_postfix(
+                    tr_L=f"{train_latent_avg:.4f}",
+                    tr_M=f"{train_mask_avg:.4f}",
+                    tr_T=f"{train_total_avg:.4f}",
+                    vl_L=f"{val_latent_avg:.4f}",
+                    vl_M=f"{val_mask_avg:.4f}",
+                    vl_T=f"{val_total_avg:.4f}",
+                    sec=f"{epoch_elapsed:.0f}s",
+                    ETA=eta_clock.strftime("%H:%M:%S"),
+                )
 
         torch.save(model.state_dict(), output_path)
         print(f"\nTraining complete. Weights saved to {output_path}")
