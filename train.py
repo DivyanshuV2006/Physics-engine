@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 import time
@@ -19,6 +20,13 @@ from model import DepthRoutedLatentWorldModel
 This script assembles data, model, optimizer, and losses into a standard
 PyTorch loop so experiments are reproducible and easy to run from CLI.
 """
+
+
+def _atomic_save_state_dict(model: nn.Module, output_path: str, temp_filename: str) -> None:
+    """Atomically saves weights by staging to a temp file then replacing."""
+    temp_path = os.path.join(os.path.dirname(output_path) or ".", temp_filename)
+    torch.save(model.state_dict(), temp_path)
+    os.replace(temp_path, output_path)
 
 
 def train(args: argparse.Namespace) -> None:
@@ -124,8 +132,12 @@ def train(args: argparse.Namespace) -> None:
     mask_loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     output_path = "depth_routed_latent_world_model.pt"
+    interrupt_output_path = "depth_routed_latent_world_model_interrupt.pt"
     model.train()
     train_start_time = time.time()
+    training_completed = False
+    interrupted = False
+    unexpected_error: BaseException | None = None
     try:
         for epoch in range(args.epochs):
             epoch_start_time = time.time()
@@ -240,13 +252,35 @@ def train(args: argparse.Namespace) -> None:
                 f"epoch_time={epoch_elapsed:.1f}s | "
                 f"eta={eta_seconds/60.0:.1f}m (finishes ~ {eta_clock.strftime('%H:%M:%S')})"
             )
-
-        torch.save(model.state_dict(), output_path)
-        print(f"\nTraining complete. Weights saved to {output_path}")
+        training_completed = True
     except KeyboardInterrupt:
-        # Save partial training progress if the user interrupts (e.g. Ctrl+C).
-        torch.save(model.state_dict(), output_path)
-        print(f"\nTraining interrupted. Partial weights saved to {output_path}")
+        interrupted = True
+    except BaseException as exc:
+        unexpected_error = exc
+    finally:
+        try:
+            # Always attempt to save a checkpoint via atomic swap.
+            _atomic_save_state_dict(model, output_path, "temp_weights.pt")
+            if interrupted:
+                _atomic_save_state_dict(model, interrupt_output_path, "temp_interrupt_weights.pt")
+                print(
+                    f"\nTraining interrupted. Partial weights saved to {output_path} "
+                    f"and {interrupt_output_path}"
+                )
+            elif unexpected_error is not None:
+                _atomic_save_state_dict(model, interrupt_output_path, "temp_interrupt_weights.pt")
+                print(
+                    f"\nTraining stopped due to error; emergency weights saved to "
+                    f"{output_path} and {interrupt_output_path}"
+                )
+            elif training_completed:
+                print(f"\nTraining complete. Weights saved to {output_path}")
+        except Exception as save_exc:
+            print(f"\nWarning: failed to save checkpoint on exit: {save_exc}")
+
+    if unexpected_error is not None:
+        raise unexpected_error
+    if interrupted:
         return
 
 
