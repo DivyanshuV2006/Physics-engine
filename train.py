@@ -130,6 +130,7 @@ def train(args: argparse.Namespace) -> None:
     # Weighted logits BCE penalizes missing sparse foreground pixels.
     pos_weight = torch.tensor([40.0], device=device)
     mask_loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    trajectory_align_loss_fn = nn.SmoothL1Loss()
 
     output_path = "depth_routed_latent_world_model.pt"
     interrupt_output_path = "depth_routed_latent_world_model_interrupt.pt"
@@ -160,7 +161,10 @@ def train(args: argparse.Namespace) -> None:
                     target_mask = batch["target_mask"].to(device)  # [B, T, 1, H, W]
 
                     optimizer.zero_grad(set_to_none=True)
-                    z_hat, mask_logits = model(z_0=z_0, depth_map=depth_map, trajectory=trajectory)
+                    z_hat, mask_logits, aux = model(
+                        z_0=z_0, depth_map=depth_map, trajectory=trajectory, return_aux=True
+                    )
+                    pred_centers = aux["mask_centers"]  # [B, T, 2], same normalized coordinate system as trajectory
 
                     logits_min = float(mask_logits.detach().amin().item())
                     logits_max = float(mask_logits.detach().amax().item())
@@ -174,7 +178,15 @@ def train(args: argparse.Namespace) -> None:
 
                     latent_loss = latent_loss_fn(z_hat, target_z)
                     mask_loss = mask_loss_fn(mask_logits, target_mask)
-                    total_loss = latent_loss + mask_loss
+                    traj_align_loss = trajectory_align_loss_fn(pred_centers, trajectory)
+                    # Soft range constraint (instead of hard tanh clamp): penalize only out-of-bounds coords.
+                    traj_range_penalty = torch.relu(torch.abs(pred_centers) - 1.0).pow(2).mean()
+                    total_loss = (
+                        latent_loss
+                        + mask_loss
+                        + args.traj_align_weight * traj_align_loss
+                        + args.traj_range_weight * traj_range_penalty
+                    )
 
                     total_loss.backward()
                     if mask_collapse_detected:
@@ -217,10 +229,20 @@ def train(args: argparse.Namespace) -> None:
                             target_z = batch["target_z"].to(device)
                             target_mask = batch["target_mask"].to(device)
 
-                            z_hat, mask_logits = model(z_0=z_0, depth_map=depth_map, trajectory=trajectory)
+                            z_hat, mask_logits, aux = model(
+                                z_0=z_0, depth_map=depth_map, trajectory=trajectory, return_aux=True
+                            )
+                            pred_centers = aux["mask_centers"]
                             latent_loss = latent_loss_fn(z_hat, target_z)
                             mask_loss = mask_loss_fn(mask_logits, target_mask)
-                            total_loss = latent_loss + mask_loss
+                            traj_align_loss = trajectory_align_loss_fn(pred_centers, trajectory)
+                            traj_range_penalty = torch.relu(torch.abs(pred_centers) - 1.0).pow(2).mean()
+                            total_loss = (
+                                latent_loss
+                                + mask_loss
+                                + args.traj_align_weight * traj_align_loss
+                                + args.traj_range_weight * traj_range_penalty
+                            )
 
                             val_latent_loss += latent_loss.item()
                             val_mask_loss += mask_loss.item()
@@ -296,6 +318,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slot-dim", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--traj-align-weight", type=float, default=1.0, help="Weight for mask-center trajectory alignment loss.")
+    parser.add_argument("--traj-range-weight", type=float, default=0.1, help="Weight for soft out-of-range coordinate penalty.")
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--val-split", type=float, default=0.2, help="Validation split fraction (e.g. 0.2).")
     parser.add_argument("--split-seed", type=int, default=42, help="Random seed for train/validation split.")

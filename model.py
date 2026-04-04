@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -211,8 +211,12 @@ class DepthRoutedLatentWorldModel(nn.Module):
         return spatial_logits
 
     def forward(
-        self, z_0: torch.Tensor, depth_map: torch.Tensor, trajectory: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self,
+        z_0: torch.Tensor,
+        depth_map: torch.Tensor,
+        trajectory: torch.Tensor,
+        return_aux: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         """Rolls out depth-routed latent predictions across time.
 
         The recurrent state models object dynamics, while depth routing applies
@@ -233,6 +237,7 @@ class DepthRoutedLatentWorldModel(nn.Module):
 
         z_seq = []
         m_seq = []
+        center_seq = []
 
         time_iterator = range(time_steps)
         if self.use_tqdm:
@@ -249,9 +254,9 @@ class DepthRoutedLatentWorldModel(nn.Module):
             visible_alpha = torch.sigmoid(visible_logit).view(batch_size, 1, 1, 1)  # [B,1,1,1]
 
             # Physics RNN controls spatial placement and spread (fully differentiable).
-            # Tanh strictly bounds predicted centers to [-1, 1] in grid-sample coordinates.
+            # Keep this branch linear (no hard tanh clamp) so gradients stay alive.
             center_delta = self.position_head(hidden)  # [B, 2]
-            center_t = torch.tanh(traj_t + center_delta)  # [B, 2]
+            center_t = traj_t + 0.25 * center_delta  # [B, 2]
             # Sigma scaled for normalized coordinate space; small sphere footprint.
             sigma_t = 0.05 + 0.05 * torch.sigmoid(self.sigma_head(hidden))  # [B, 1] in [0.05, 0.10]
 
@@ -272,7 +277,11 @@ class DepthRoutedLatentWorldModel(nn.Module):
 
             z_seq.append(routed_t)
             m_seq.append(mask_logits)
+            center_seq.append(center_t)
 
         z_hat = torch.stack(z_seq, dim=1)  # [B, T, C, H, W]
         mask_hat = torch.stack(m_seq, dim=1)  # [B, T, 1, H, W]
-        return z_hat, mask_hat
+        if not return_aux:
+            return z_hat, mask_hat
+        aux = {"mask_centers": torch.stack(center_seq, dim=1)}  # [B, T, 2]
+        return z_hat, mask_hat, aux
