@@ -251,6 +251,17 @@ class KubricOcclusionDataset(Dataset):
         y = torch.zeros_like(x)
         return torch.stack([x, y], dim=-1)  # [T, 2]
 
+    def _normalize_trajectory_if_needed(self, trajectory: torch.Tensor) -> torch.Tensor:
+        """Ensures trajectory is in [-1, 1] even if source coordinates are pixels."""
+        if trajectory.numel() == 0:
+            return trajectory
+        max_abs = float(torch.max(torch.abs(trajectory)).item())
+        if max_abs <= 1.0:
+            return trajectory
+        # Convert pixel coordinates [0, image_size-1] to normalized [-1, 1].
+        half = float(self.image_size / 2.0)
+        return (trajectory / half) - 1.0
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Builds one training sample with aligned inputs and future targets.
 
@@ -288,7 +299,7 @@ class KubricOcclusionDataset(Dataset):
 
         target_z = torch.stack(target_z_list, dim=0)  # [T, C, H, W]
         target_mask = torch.stack(target_mask_list, dim=0)  # [T, 1, H, W]
-        trajectory = self._mock_trajectory()  # [T, 2]
+        trajectory = self._normalize_trajectory_if_needed(self._mock_trajectory())  # [T, 2]
 
         return {
             "z_0": z_0.float(),

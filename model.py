@@ -130,15 +130,21 @@ class DepthRoutedLatentWorldModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(slot_dim // 2, 1),
         )
-        self.mask_offset_head = nn.Sequential(
+        self.position_head = nn.Sequential(
             nn.Linear(slot_dim, slot_dim // 2),
             nn.ReLU(inplace=True),
-            nn.Linear(slot_dim // 2, 3),  # dx, dy, sigma-control
+            nn.Linear(slot_dim // 2, 2),
+        )
+        self.sigma_head = nn.Sequential(
+            nn.Linear(slot_dim, slot_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(slot_dim // 2, 1),
         )
         # Explicit bias init for visibility branch to avoid deep-negative startup logits.
         nn.init.constant_(self.visibility_head[-1].bias, 0.0)
-        # Start with no spatial offset and moderate Gaussian spread.
-        nn.init.constant_(self.mask_offset_head[-1].bias, 0.0)
+        # Start centered and with moderate spread in normalized coordinates.
+        nn.init.constant_(self.position_head[-1].bias, 0.0)
+        nn.init.constant_(self.sigma_head[-1].bias, 0.0)
         self.use_tqdm = use_tqdm
 
     @staticmethod
@@ -243,10 +249,11 @@ class DepthRoutedLatentWorldModel(nn.Module):
             visible_alpha = torch.sigmoid(visible_logit).view(batch_size, 1, 1, 1)  # [B,1,1,1]
 
             # Physics RNN controls spatial placement and spread (fully differentiable).
-            mask_params = self.mask_offset_head(hidden)  # [B, 3]
-            delta_xy = 0.20 * torch.tanh(mask_params[:, :2])  # [B, 2]
-            center_t = (traj_t + delta_xy).clamp(min=-1.0, max=1.0)  # [B, 2]
-            sigma_t = 0.10 + 0.22 * torch.sigmoid(mask_params[:, 2:3])  # [B, 1]
+            # Tanh strictly bounds predicted centers to [-1, 1] in grid-sample coordinates.
+            center_delta = self.position_head(hidden)  # [B, 2]
+            center_t = torch.tanh(traj_t + center_delta)  # [B, 2]
+            # Sigma scaled for normalized coordinate space; small sphere footprint.
+            sigma_t = 0.05 + 0.05 * torch.sigmoid(self.sigma_head(hidden))  # [B, 1] in [0.05, 0.10]
 
             spatial_logits = self._spatial_stamp_logits(
                 center_t=center_t,

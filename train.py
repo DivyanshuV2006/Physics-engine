@@ -108,7 +108,8 @@ def train(args: argparse.Namespace) -> None:
     tracked_modules = (
         ("physics_rnn", model.physics_rnn),
         ("visibility_head", model.visibility_head),
-        ("mask_offset_head", model.mask_offset_head),
+        ("position_head", model.position_head),
+        ("sigma_head", model.sigma_head),
     )
     for module_name, module in tracked_modules:
         missing = [name for name, param in module.named_parameters() if id(param) not in opt_param_ids]
