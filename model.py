@@ -124,6 +124,7 @@ class DepthRoutedLatentWorldModel(nn.Module):
         super().__init__()
         self.slot_extractor = SlotExtractor(in_channels=latent_channels, slot_dim=slot_dim)
         self.physics_rnn = nn.GRUCell(input_size=2, hidden_size=slot_dim)
+        self.velocity_multiplier = nn.Parameter(torch.tensor(1.0))
         self.renderer = SpatialBroadcastDecoder(slot_dim=slot_dim, out_channels=latent_channels)
         self.visibility_head = nn.Sequential(
             nn.Linear(slot_dim, slot_dim // 2),
@@ -246,7 +247,9 @@ class DepthRoutedLatentWorldModel(nn.Module):
 
         for t in time_iterator:
             traj_t = trajectory[:, t, :]  # [B, 2]
-            hidden = self.physics_rnn(traj_t, hidden)  # [B, slot_dim]
+            # Zero-frame logic: first predicted frame uses initial slot directly.
+            if t > 0:
+                hidden = self.physics_rnn(self.velocity_multiplier * traj_t, hidden)  # [B, slot_dim]
 
             depth_visible_logit = self._route_depth(depth_map, traj_t, slot_depth)  # [B, 1]
             learned_visible_logit = self.visibility_head(hidden)  # [B, 1]

@@ -44,6 +44,15 @@ def train(args: argparse.Namespace) -> None:
     if not (0.0 < args.val_split < 1.0):
         raise ValueError(f"--val-split must be in (0, 1), got {args.val_split}.")
 
+    def _ensure_ndc(coords: torch.Tensor, image_size: int) -> torch.Tensor:
+        """Normalizes pixel-space coordinates to [-1, 1] if needed."""
+        if coords.numel() == 0:
+            return coords
+        if float(torch.max(torch.abs(coords)).item()) <= 1.0:
+            return coords
+        half = float(image_size / 2.0)
+        return (coords / half) - 1.0
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
@@ -124,6 +133,9 @@ def train(args: argparse.Namespace) -> None:
         if missing:
             raise RuntimeError(f"Optimizer is missing parameters for {module_name}: {missing}")
     print("Optimizer tracking verified for physics and mask branches.")
+    if id(model.velocity_multiplier) not in opt_param_ids:
+        raise RuntimeError("Optimizer is missing parameter: velocity_multiplier")
+    print(f"Initial velocity_multiplier={float(model.velocity_multiplier.detach().item()):.4f}")
 
     # MSE supervises continuous latent reconstruction quality.
     latent_loss_fn = nn.MSELoss()
@@ -157,6 +169,7 @@ def train(args: argparse.Namespace) -> None:
                     z_0 = batch["z_0"].to(device)  # [B, C, H, W]
                     depth_map = batch["depth_map"].to(device)  # [B, 1, H, W]
                     trajectory = batch["trajectory"].to(device)  # [B, T, 2]
+                    trajectory = _ensure_ndc(trajectory, args.image_size)
                     target_z = batch["target_z"].to(device)  # [B, T, C, H, W]
                     target_mask = batch["target_mask"].to(device)  # [B, T, 1, H, W]
 
@@ -165,6 +178,12 @@ def train(args: argparse.Namespace) -> None:
                         z_0=z_0, depth_map=depth_map, trajectory=trajectory, return_aux=True
                     )
                     pred_centers = aux["mask_centers"]  # [B, T, 2], same normalized coordinate system as trajectory
+                    if z_hat.shape[:2] != target_z.shape[:2] or mask_logits.shape[:2] != target_mask.shape[:2]:
+                        raise RuntimeError(
+                            "Temporal alignment mismatch: model and targets have different [B, T] shapes. "
+                            f"z_hat={tuple(z_hat.shape)}, target_z={tuple(target_z.shape)}, "
+                            f"mask_logits={tuple(mask_logits.shape)}, target_mask={tuple(target_mask.shape)}"
+                        )
 
                     logits_min = float(mask_logits.detach().amin().item())
                     logits_max = float(mask_logits.detach().amax().item())
@@ -226,6 +245,7 @@ def train(args: argparse.Namespace) -> None:
                             z_0 = batch["z_0"].to(device)
                             depth_map = batch["depth_map"].to(device)
                             trajectory = batch["trajectory"].to(device)
+                            trajectory = _ensure_ndc(trajectory, args.image_size)
                             target_z = batch["target_z"].to(device)
                             target_mask = batch["target_mask"].to(device)
 
@@ -233,6 +253,10 @@ def train(args: argparse.Namespace) -> None:
                                 z_0=z_0, depth_map=depth_map, trajectory=trajectory, return_aux=True
                             )
                             pred_centers = aux["mask_centers"]
+                            if z_hat.shape[:2] != target_z.shape[:2] or mask_logits.shape[:2] != target_mask.shape[:2]:
+                                raise RuntimeError(
+                                    "Temporal alignment mismatch in validation pass."
+                                )
                             latent_loss = latent_loss_fn(z_hat, target_z)
                             mask_loss = mask_loss_fn(mask_logits, target_mask)
                             traj_align_loss = trajectory_align_loss_fn(pred_centers, trajectory)

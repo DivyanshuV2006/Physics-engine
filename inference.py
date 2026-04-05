@@ -99,6 +99,7 @@ def run_inference(args):
     print("Generating visual proof...")
     # 4. Plot the Ground Truth vs. the Model's Prediction
     time_steps = min(args.sequence_length, pred_mask_np.shape[0], target_mask_np.shape[0])
+    print("Temporal alignment: plotting pred[t] directly against target[t] (first output -> t=1 slot).")
     fig, axes = plt.subplots(2, time_steps, figsize=(2.8 * time_steps, 6.0), squeeze=False)
     
     fig.suptitle("Object Permanence Proof: Ground Truth vs. Predicted Occlusion", fontsize=16, fontweight='bold', y=1.05)
