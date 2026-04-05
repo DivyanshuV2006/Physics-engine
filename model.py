@@ -195,15 +195,17 @@ class DepthRoutedLatentWorldModel(nn.Module):
         returns: [B, 1, H, W] logits
         """
         batch_size = center_t.shape[0]
-        y_coords = torch.linspace(-1.0, 1.0, steps=height, device=center_t.device, dtype=center_t.dtype)
-        x_coords = torch.linspace(-1.0, 1.0, steps=width, device=center_t.device, dtype=center_t.dtype)
+        # Pixel-space Gaussian with explicit NDC->pixel center mapping:
+        # center_x = (traj_x + 1) * 0.5 * (W - 1), center_y = (traj_y + 1) * 0.5 * (H - 1)
+        y_coords = torch.linspace(0.0, float(height - 1), steps=height, device=center_t.device, dtype=center_t.dtype)
+        x_coords = torch.linspace(0.0, float(width - 1), steps=width, device=center_t.device, dtype=center_t.dtype)
         yy, xx = torch.meshgrid(y_coords, x_coords, indexing="ij")
-        yy = yy.unsqueeze(0).expand(batch_size, -1, -1)  # [B, H, W]
-        xx = xx.unsqueeze(0).expand(batch_size, -1, -1)  # [B, H, W]
+        yy = yy.unsqueeze(0).expand(batch_size, -1, -1)  # [B,H,W]
+        xx = xx.unsqueeze(0).expand(batch_size, -1, -1)  # [B,H,W]
 
-        cx = center_t[:, 0].view(batch_size, 1, 1)  # [B,1,1]
-        cy = center_t[:, 1].view(batch_size, 1, 1)  # [B,1,1]
-        sigma = sigma_t.view(batch_size, 1, 1).clamp(min=0.05, max=0.5)  # [B,1,1]
+        cx = ((center_t[:, 0] + 1.0) * 0.5 * float(width - 1)).view(batch_size, 1, 1)  # [B,1,1]
+        cy = ((center_t[:, 1] + 1.0) * 0.5 * float(height - 1)).view(batch_size, 1, 1)  # [B,1,1]
+        sigma = sigma_t.view(batch_size, 1, 1).clamp(min=0.05, max=0.10) * (0.5 * float(height + width))
         dist2 = (xx - cx) ** 2 + (yy - cy) ** 2  # [B,H,W]
 
         spatial_prob = torch.exp(-dist2 / (2.0 * (sigma ** 2)))
@@ -247,9 +249,7 @@ class DepthRoutedLatentWorldModel(nn.Module):
 
         for t in time_iterator:
             traj_t = trajectory[:, t, :]  # [B, 2]
-            # Zero-frame logic: first predicted frame uses initial slot directly.
-            if t > 0:
-                hidden = self.physics_rnn(self.velocity_multiplier * traj_t, hidden)  # [B, slot_dim]
+            hidden = self.physics_rnn(self.velocity_multiplier * traj_t, hidden)  # [B, slot_dim]
 
             depth_visible_logit = self._route_depth(depth_map, traj_t, slot_depth)  # [B, 1]
             learned_visible_logit = self.visibility_head(hidden)  # [B, 1]
@@ -257,9 +257,9 @@ class DepthRoutedLatentWorldModel(nn.Module):
             visible_alpha = torch.sigmoid(visible_logit).view(batch_size, 1, 1, 1)  # [B,1,1,1]
 
             # Physics RNN controls spatial placement and spread (fully differentiable).
-            # Keep this branch linear (no hard tanh clamp) so gradients stay alive.
+            # Re-apply tanh bounding to keep centers strictly in NDC [-1, 1].
             center_delta = self.position_head(hidden)  # [B, 2]
-            center_t = traj_t + 0.25 * center_delta  # [B, 2]
+            center_t = torch.tanh(traj_t + 0.25 * center_delta)  # [B, 2]
             # Sigma scaled for normalized coordinate space; small sphere footprint.
             sigma_t = 0.05 + 0.05 * torch.sigmoid(self.sigma_head(hidden))  # [B, 1] in [0.05, 0.10]
 

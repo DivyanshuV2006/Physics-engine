@@ -26,6 +26,16 @@ def _select_sequence_index(dataset: KubricOcclusionDataset, sample_index: int, s
     return best_idx
 
 
+def _ensure_ndc(coords: torch.Tensor, image_size: int) -> torch.Tensor:
+    """Mirrors train.py trajectory normalization for inference consistency."""
+    if coords.numel() == 0:
+        return coords
+    if float(torch.max(torch.abs(coords)).item()) <= 1.0:
+        return coords
+    half = float(image_size / 2.0)
+    return (coords / half) - 1.0
+
+
 def run_inference(args):
     print("Loading model and weights...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -62,7 +72,7 @@ def run_inference(args):
     sample = dataset[selected_idx]
     z_0 = sample["z_0"]
     depth_map = sample["depth_map"]
-    trajectory = sample["trajectory"]
+    trajectory = _ensure_ndc(sample["trajectory"], args.image_size)
     target_mask = sample["target_mask"]
 
     # Add a batch dimension [B=1] and move to GPU
@@ -147,6 +157,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate Visual Proof")
     parser.add_argument("--data-root", type=str, required=True, help="Path to your dataset folder")
     parser.add_argument("--sequence-length", type=int, default=8)
+    parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--latent-channels", type=int, default=32)
     parser.add_argument("--slot-dim", type=int, default=128)
     parser.add_argument("--weights-path", type=str, default="depth_routed_latent_world_model.pt")
